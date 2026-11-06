@@ -270,6 +270,28 @@ Tips pemakaian di dashboard:
 - Setiap transaksi diverifikasi dengan `confirmTransaction` yang memakai blockhash **yang sama** dengan yang ditandatangani, dan `err` hasil konfirmasi selalu dicek — transaksi gagal tidak akan dilaporkan sukses.
 - Saat menjual token, ATA WSOL ditutup (`CloseAccount`) sehingga Anda menerima **SOL native**, bukan WSOL.
 
+### Memastikan versi kode yang berjalan
+
+Header dashboard menampilkan stempel build, mis. `build 2026.11.06 · mintToChecked=3akun`.
+Kalau stempel ini **tidak muncul** atau angkanya berbeda dari yang kamu harapkan, berarti
+browser masih memakai bundle lama — bukan bug baru:
+
+1. `git pull --ff-only` di folder proyek, lalu `git log --oneline -3` (harus ada commit perbaikan terbaru).
+2. Restart `npm run dev`.
+3. Hard reload browser (**Ctrl+Shift+R**). Kalau kamu memakai `npm run build` + `npm run preview`, jalankan `npm run build` ulang.
+
+Cek cepat dari terminal bahwa layout `MintToChecked` sudah benar (harus **3** akun):
+
+```bash
+awk '/public buildMintToCheckedInstruction/,/^  \}$/' src/sdk/customSdk.ts \
+  | grep -c "pubkey: mint,"
+# hasil 1  -> layout baru  (3 akun: mint, destination ATA, mint_authority)
+# hasil 2  -> layout lama   (4 akun -> UninitializedAccount di instruksi 8)
+```
+
+Selain itu dashboard mencetak ringkasan layout transaksi ke console (`console.table`):
+`#8 Token-2022 akun=3 tag=14` berarti instruksi `MintToChecked` sudah benar.
+
 ### Troubleshooting Devnet
 
 | Gejala | Penyebab & solusi |
