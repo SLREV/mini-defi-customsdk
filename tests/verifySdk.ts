@@ -116,6 +116,32 @@ async function main(): Promise<void> {
   );
   assert.equal(clone.instructions[7].data.byteLength, 10);
   assert.equal(clone.instructions[7].data[0], 14); // MintToChecked
+
+  // 3a-1. REGRESI MintToChecked: layout WAJIB 3 akun [mint, destination, mintAuthority].
+  // Versi lama menyisipkan `mint` kedua di indeks 1 (layout `TransferChecked`), sehingga
+  // Token-2022 membaca akun Mint sebagai `destination` dan transaksi gagal dengan
+  // "Error: UninitializedAccount / instruction requires an initialized account".
+  const mintToIx = clone.instructions[7];
+  assert.equal(mintToIx.keys.length, 3, 'MintToChecked harus 3 AccountMeta');
+  assert.equal(mintToIx.programId.toBase58(), TOKEN_2022_PROGRAM_ID.toBase58());
+  assert.equal(mintToIx.keys[0].pubkey.toBase58(), clone.mint.toBase58());
+  assert.equal(mintToIx.keys[0].isWritable, true);
+  assert.equal(mintToIx.keys[1].pubkey.toBase58(), clone.userTokenAta.toBase58());
+  assert.equal(mintToIx.keys[1].isWritable, true);
+  assert.equal(mintToIx.keys[2].pubkey.toBase58(), payer.publicKey.toBase58());
+  assert.equal(mintToIx.keys[2].isSigner, true);
+  // `destination` MintToChecked harus ATA yang dibuat instruksi tepat sebelumnya
+  assert.equal(clone.instructions[6].data[0], 1); // CreateIdempotent
+  assert.equal(
+    clone.instructions[6].keys[1].pubkey.toBase58(),
+    mintToIx.keys[1].pubkey.toBase58(),
+    'ATA yang dibuat harus sama dengan destination MintToChecked'
+  );
+  // mint tidak boleh muncul dua kali di dalam satu instruksi
+  assert.equal(
+    new Set(mintToIx.keys.map((k) => k.pubkey.toBase58())).size,
+    mintToIx.keys.length
+  );
   // Tanpa metadataUri, `uri` on-chain memakai URL gambar
   assert.equal(clone.resolvedMetadataUri, clone.offchainMetadataJson.image);
 
@@ -153,6 +179,24 @@ async function main(): Promise<void> {
     })
   );
   assert.ok(cloneWithJson.allocatedMintBytes > clone.allocatedMintBytes);
+
+  // 3c. Mode kompatibilitas SPL Legacy: instruksi MintToChecked tetap 3 akun,
+  //     hanya program pemiliknya yang berbeda (Tokenkeg…).
+  const cloneLegacy = await sdk.buildCloneTokenInstructions({
+    payer: payer.publicKey,
+    name: 'Nusantara Legacy',
+    symbol: 'NUSA',
+    imageUri: clone.offchainMetadataJson.image,
+    decimals: 9,
+    initialSupplyRaw: supplyRaw,
+    tokenStandard: 'SPL_LEGACY',
+  });
+  const legacyMintToIx =
+    cloneLegacy.instructions[cloneLegacy.instructions.length - 1];
+  assert.equal(legacyMintToIx.data[0], 14); // MintToChecked
+  assert.equal(legacyMintToIx.keys.length, 3);
+  assert.equal(legacyMintToIx.programId.toBase58(), TOKEN_PROGRAM_ID.toBase58());
+  assert.equal(legacyMintToIx.keys[1].pubkey.toBase58(), cloneLegacy.userTokenAta.toBase58());
 
   // 4. Uji buildCreatePoolTx (Discriminator 0, 17B payload, 15 AccountMeta lintas TokenProgram)
   const createPool = await sdk.buildCreatePoolTx({

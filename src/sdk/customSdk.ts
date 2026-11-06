@@ -953,9 +953,14 @@ export class CustomDefiSDK {
 
     return new TransactionInstruction({
       programId: tokenProgramId,
+      // `MintToChecked` = 3 akun: [mint (w), destination (w), mint_authority (s)].
+      // JANGAN menyisipkan `mint` kedua di indeks 1 — itu layout `TransferChecked`
+      // ([source, mint, destination, authority]). Dengan mint ganda, Token-2022 membaca
+      // akun Mint (bukan ATA) sebagai `destination`; datanya lalu di-unpack sebagai akun
+      // token dan gagal dengan `Error: UninitializedAccount`
+      // ("instruction requires an initialized account").
       keys: [
         { pubkey: mint, isSigner: false, isWritable: true },
-        { pubkey: mint, isSigner: false, isWritable: false },
         { pubkey: destinationAta, isSigner: false, isWritable: true },
         { pubkey: mintAuthority, isSigner: true, isWritable: false },
       ],

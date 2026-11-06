@@ -23,6 +23,7 @@ Production-ready boilerplate untuk **DeFi Token-2022 Launchpad & Virtual Liquidi
 | `Token-2022 InitializeMint2` | `u8 = 20` | `67 B` | `[u8(20), u8(decimals), Pubkey(mintAuth), u8(freezeOpt), Pubkey(freezeAuth)]` |
 | `Token-2022 TokenMetadata::Initialize` | `sha256[..8]` | Variabel | `8B disc + BorshString(name) + BorshString(symbol) + BorshString(uri)` |
 | `Token-2022 TokenMetadata::UpdateField` | `sha256[..8]` | Variabel | `8B disc + u8(3 = Field::Key) + BorshString(key) + BorshString(value)` |
+| `Token-2022 MintToChecked` | `u8 = 14` | `10 B` | `[u8(14), u64_le(amount), u8(decimals)]` — akun: **3** = `[mint (w), destination ATA (w), mint_authority (s)]` |
 | `AMM initialize_pool` | `u8 = 0` | `17 B` | `[u8(0), u64_le(initial_real_token_y), u64_le(virtual_reserves_x)]` |
 | `AMM add_liquidity` | `u8 = 1` | `25 B` | `[u8(1), u64_le(amount_x), u64_le(amount_y), u64_le(min_lp_out)]` |
 | `AMM swap` | `u8 = 2` | `18 B` | `[u8(2), u64_le(amount_in), u64_le(min_amount_out), u8(x_to_y)]` |
@@ -288,6 +289,8 @@ Tips pemakaian di dashboard:
 - `virtual_reserves_y` diset **0** (sebelumnya `initial_real_token_y`, membuat token Y terhitung dua kali dan suplai LP tidak konsisten dengan `k`).
 - Constraint vault diperketat (`token::mint`, `token::authority = pool_state`) pada `add_liquidity` dan `swap`.
 - `buildCreatePoolTx()` kini membuat ATA token Y lebih dulu (sebelumnya transaksi gagal `AccountNotInitialized` bila pengguna belum punya ATA).
+- `buildMintToCheckedInstruction()` sebelumnya mengirim **4** `AccountMeta` (menyisipkan `mint` read-only di indeks 1, layout `TransferChecked`). Token-2022 lalu membaca akun **Mint** sebagai `destination`, sehingga transaksi gagal `Error processing Instruction 8: instruction requires an initialized account` (`Program log: Error: UninitializedAccount`). Sekarang layout benar: `[mint, destination ATA, mint_authority]`, dan ada uji regresi yang memastikan `destination` sama dengan ATA hasil `CreateIdempotent` sebelumnya.
+- Pesan error preflight kini mengenali `UninitializedAccount` dan menyebut nomor instruksi yang gagal beserta saran perbaikannya.
 - Dashboard: kegagalan swap tidak lagi ditandai `SUCCESS`, dan estimasi quote pembelian awal memakai cadangan efektif yang benar.
 - Uji tambahan: edge-case parser/matematika, ukuran transaksi, dan konsistensi `LP_awal = sqrt(k)`.
 
