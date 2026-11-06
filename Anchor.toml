@@ -1,5 +1,19 @@
 [toolchain]
 anchor_version = "0.31.1"
+# Anchor 0.31.1: `solana_version` bikin `anchor <cmd>` otomatis switch ke rilis
+# Agave ini (via `agave-install`) selama perintah berjalan, lalu mengembalikannya.
+#
+# Kenapa dipatok: `anchor build` memanggil `cargo-build-sbf`, dan BINARY ITU
+# membawa Cargo/rustc sendiri (platform-tools). Agave <= 3.x membawa Cargo 1.84
+# yang belum mengenal edition 2024, sehingga manifest `zeroize_derive 1.5`,
+# `blake3 1.8.3`, `constant_time_eq 0.4.2` gagal di-parse:
+#
+#   error: failed to parse manifest at `.../zeroize_derive-1.5.0/Cargo.toml`
+#   Caused by: feature `edition2024` is required
+#
+# Agave >= 4.0 membawa platform-tools v1.53+ (rustc 1.89), jadi edition 2024
+# didukung. Cek dengan `npm run toolchain:check`.
+solana_version = "4.4.1"
 
 [features]
 skip-lint = false

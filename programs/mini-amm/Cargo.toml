@@ -3,6 +3,9 @@ name = "mini-amm"
 version = "0.1.0"
 description = "Token-2022 & SPL Hybrid Virtual Liquidity Constant Product AMM built with Anchor"
 edition = "2021"
+# MSRV eksplisit supaya resolver 3 (MSRV-aware) tahu batas atas versi
+# dependency yang boleh dipilih. Lihat README "Gagal `anchor build`".
+rust-version.workspace = true
 license = "MIT"
 
 [lib]
