@@ -136,6 +136,15 @@ const describeRpcError = (err: unknown, rpcEndpoint: string): string => {
   if (/User rejected|rejected the request/i.test(haystack)) {
     return 'Transaksi ditolak di wallet.';
   }
+  if (
+    /UninitializedAccount|instruction requires an initialized account|AccountNotInitialized/i.test(
+      haystack
+    )
+  ) {
+    const failedIx = raw.match(/Error processing Instruction (\d+)/i)?.[1];
+    const tail = logs && logs.length > 0 ? `\nLog: ${logs.slice(-2).join(' | ')}` : '';
+    return `Instruksi ${failedIx ?? '?'} gagal: ada akun token (mint / ATA / vault) yang belum terinisialisasi — cek urutan CreateIdempotent ATA sebelum MintTo/TransferChecked.${tail}`;
+  }
   return logs && logs.length > 0 ? `${raw}\nLog: ${logs.slice(-3).join(' | ')}` : raw;
 };
 
