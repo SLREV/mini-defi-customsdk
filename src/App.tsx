@@ -2,8 +2,10 @@ import React, { useMemo, useState } from 'react';
 import {
   AccountInfo,
   Commitment,
+  ComputeBudgetProgram,
   Connection,
   Keypair,
+  LAMPORTS_PER_SOL,
   PublicKey,
   Transaction,
 } from '@solana/web3.js';
@@ -70,7 +72,72 @@ interface BinaryTelemetry {
   cloneIxCount: number;
 }
 
-const DEVNET_RPC_ENDPOINT = 'https://api.devnet.solana.com';
+/**
+ * Endpoint RPC devnet. Bisa dioverride lewat `.env` (VITE_RPC_ENDPOINT) bila RPC publik
+ * kena rate-limit (mis. Helius/QuickNode devnet).
+ */
+const DEVNET_RPC_ENDPOINT =
+  (import.meta.env.VITE_RPC_ENDPOINT as string | undefined)?.trim() ||
+  'https://api.devnet.solana.com';
+
+const DEVNET_RPC_HOST = ((): string => {
+  try {
+    return new URL(DEVNET_RPC_ENDPOINT).host;
+  } catch {
+    return DEVNET_RPC_ENDPOINT;
+  }
+})();
+
+/** Batas minimum SOL agar pipeline devnet tidak gagal di tengah jalan. */
+const MIN_DEVNET_SOL = 0.05;
+
+/**
+ * Compute unit limit eksplisit: transaksi mint Token-2022 mengalokasikan TLV metadata
+ * (+ realloc) plus 8 instruksi, sehingga bisa melewati default 200k CU di devnet.
+ */
+const CLONE_TX_COMPUTE_UNITS = 600_000;
+const AMM_TX_COMPUTE_UNITS = 300_000;
+
+const withComputeBudget = (tx: Transaction, units: number): Transaction => {
+  const rebuilt = new Transaction().add(
+    ComputeBudgetProgram.setComputeUnitLimit({ units }),
+    ...tx.instructions
+  );
+  rebuilt.feePayer = tx.feePayer;
+  rebuilt.recentBlockhash = tx.recentBlockhash;
+  return rebuilt;
+};
+
+/** Terjemahkan error RPC/preflight menjadi pesan yang bisa ditindaklanjuti. */
+const describeRpcError = (err: unknown, rpcEndpoint: string): string => {
+  const logs =
+    typeof err === 'object' && err !== null && 'logs' in err
+      ? ((err as { logs?: string[] | null }).logs ?? null)
+      : null;
+  const raw = err instanceof Error ? err.message : String(err);
+  const haystack = `${raw} ${(logs ?? []).join(' ')}`;
+
+  if (
+    /Attempt to load a program that does not exist|InvalidProgramId|UnsupportedProgramId|program that does not exist/i.test(
+      haystack
+    )
+  ) {
+    return `Program AMM ${DEFAULT_AMM_PROGRAM_ID.toBase58()} belum ter-deploy di ${rpcEndpoint}. Jalankan "anchor build && anchor deploy --provider.cluster devnet" terlebih dahulu.`;
+  }
+  if (/insufficient (funds|lamports)|InsufficientFundsForRent|0x1/i.test(haystack)) {
+    return `Saldo SOL wallet tidak cukup untuk fee/rent di ${rpcEndpoint}. Di devnet klik "Airdrop 1 SOL" atau pakai faucet.solana.com.`;
+  }
+  if (/Blockhash not found|block height exceeded|BlockhashNotFound/i.test(haystack)) {
+    return 'Blockhash transaksi kedaluwarsa. Coba kirim ulang (pipeline akan mengambil blockhash baru).';
+  }
+  if (/429|Too Many Requests|rate.?limit|-32429/i.test(haystack)) {
+    return `RPC ${rpcEndpoint} menolak karena rate-limit. Set VITE_RPC_ENDPOINT ke RPC devnet lain (Helius/QuickNode) di file .env.`;
+  }
+  if (/User rejected|rejected the request/i.test(haystack)) {
+    return 'Transaksi ditolak di wallet.';
+  }
+  return logs && logs.length > 0 ? `${raw}\nLog: ${logs.slice(-3).join(' | ')}` : raw;
+};
 
 class SandboxBinaryConnection extends Connection {
   private readonly accounts = new Map<string, AccountInfo<Buffer>>();
@@ -179,6 +246,10 @@ export default function App(): React.ReactElement {
   const [userTokenBalanceRaw, setUserTokenBalanceRaw] = useState<bigint>(0n);
   const [telemetry, setTelemetry] = useState<BinaryTelemetry | null>(null);
 
+  // Status devnet: saldo SOL wallet & proses airdrop
+  const [solBalance, setSolBalance] = useState<number | null>(null);
+  const [airdropBusy, setAirdropBusy] = useState<boolean>(false);
+
   // Interactive Swap Terminal State
   const [tradeSide, setTradeSide] = useState<'BUY' | 'SELL'>('BUY');
   const [tradeAmountInput, setTradeAmountInput] = useState<string>('5');
@@ -188,6 +259,29 @@ export default function App(): React.ReactElement {
     () => new Connection(DEVNET_RPC_ENDPOINT, 'confirmed'),
     []
   );
+
+  const readSolBalance = async (
+    conn: Connection,
+    pubkey: PublicKey
+  ): Promise<number | null> => {
+    try {
+      const lamports = await conn.getBalance(pubkey, 'confirmed');
+      return lamports / LAMPORTS_PER_SOL;
+    } catch {
+      return null;
+    }
+  };
+
+  const refreshSolBalance = async (
+    conn: Connection,
+    pubkey: PublicKey | null | undefined
+  ): Promise<void> => {
+    if (!pubkey || executionMode !== 'DEVNET') {
+      setSolBalance(null);
+      return;
+    }
+    setSolBalance(await readSolBalance(conn, pubkey));
+  };
 
   const handleConnectWallet = async (preferInjected: boolean): Promise<void> => {
     setErrorMessage(null);
@@ -199,6 +293,7 @@ export default function App(): React.ReactElement {
         setStatusBanner(
           `Wallet Terhubung (${shortenAddress(res.publicKey.toBase58())})`
         );
+        await refreshSolBalance(devnetConnection, res.publicKey);
         return;
       } catch (err) {
         setErrorMessage(
@@ -213,6 +308,7 @@ export default function App(): React.ReactElement {
     setStatusBanner(
       `Mock Keypair Terhubung (${shortenAddress(ephemeralKeypair.publicKey.toBase58())})`
     );
+    await refreshSolBalance(devnetConnection, ephemeralKeypair.publicKey);
   };
 
   const handleDisconnectWallet = async (): Promise<void> => {
@@ -221,7 +317,51 @@ export default function App(): React.ReactElement {
     }
     setWalletPubkey(null);
     setWalletType(null);
+    setSolBalance(null);
     setStatusBanner('Wallet terputus');
+  };
+
+  /**
+   * Airdrop devnet untuk wallet ephemeral (mock) agar mode "Devnet RPC" bisa dipakai
+   * tanpa Phantom. RPC publik sering membatasi airdrop; bila gagal, pakai faucet.solana.com.
+   */
+  const handleAirdrop = async (): Promise<void> => {
+    const target = walletPubkey ?? ephemeralKeypair.publicKey;
+    setErrorMessage(null);
+    setAirdropBusy(true);
+    try {
+      if (executionMode !== 'DEVNET') {
+        throw new Error('Airdrop hanya tersedia pada mode Devnet RPC');
+      }
+      const signature = await devnetConnection.requestAirdrop(
+        target,
+        LAMPORTS_PER_SOL
+      );
+      const latest = await devnetConnection.getLatestBlockhash('confirmed');
+      const confirmation = await devnetConnection.confirmTransaction(
+        {
+          signature,
+          blockhash: latest.blockhash,
+          lastValidBlockHeight: latest.lastValidBlockHeight,
+        },
+        'confirmed'
+      );
+      if (confirmation.value.err) {
+        throw new Error(JSON.stringify(confirmation.value.err));
+      }
+      setStatusBanner(
+        `Airdrop 1 SOL devnet berhasil (${shortenAddress(target.toBase58(), 5)})`
+      );
+      await refreshSolBalance(devnetConnection, target);
+    } catch (err) {
+      setErrorMessage(
+        `Airdrop gagal: ${
+          err instanceof Error ? err.message : String(err)
+        }. Coba faucet.solana.com atau ganti VITE_RPC_ENDPOINT.`
+      );
+    } finally {
+      setAirdropBusy(false);
+    }
   };
 
   const updateStep = (
@@ -240,6 +380,22 @@ export default function App(): React.ReactElement {
     extraSigners: Keypair[],
     conn: Connection
   ): Promise<{ signature: string; byteLength: number }> => {
+    if (!tx.feePayer) {
+      throw new Error('feePayer transaksi belum diset');
+    }
+
+    // Ambil blockhash + lastValidBlockHeight SEKALI, pakai pasangan yang sama saat
+    // sign & confirm (versi lama memakai blockhash baru setelah kirim, sehingga
+    // deteksi kedaluwarsa salah dan kegagalan on-chain tidak pernah terdeteksi).
+    let blockhash = tx.recentBlockhash;
+    let lastValidBlockHeight: number | undefined;
+    if (executionMode === 'DEVNET') {
+      const latest = await conn.getLatestBlockhash('confirmed');
+      blockhash = latest.blockhash;
+      lastValidBlockHeight = latest.lastValidBlockHeight;
+      tx.recentBlockhash = latest.blockhash;
+    }
+
     if (extraSigners.length > 0) {
       tx.partialSign(...extraSigners);
     }
@@ -247,6 +403,8 @@ export default function App(): React.ReactElement {
       tx.partialSign(ephemeralKeypair);
     } else if (walletType === 'INJECTED' && window.solana) {
       tx = await window.solana.signTransaction(tx);
+    } else {
+      throw new Error('Wallet injeksi tidak tersedia — hubungkan Phantom ulang');
     }
 
     const rawTx = tx.serialize();
@@ -258,20 +416,35 @@ export default function App(): React.ReactElement {
       return { signature: sig, byteLength: rawTx.byteLength };
     }
 
-    const signature = await conn.sendRawTransaction(rawTx, {
-      skipPreflight: false,
-      preflightCommitment: 'confirmed',
-    });
-    const latest = await conn.getLatestBlockhash('confirmed');
-    await conn.confirmTransaction(
-      {
-        signature,
-        blockhash: latest.blockhash,
-        lastValidBlockHeight: latest.lastValidBlockHeight,
-      },
-      'confirmed'
-    );
-    return { signature, byteLength: rawTx.byteLength };
+    try {
+      const signature = await conn.sendRawTransaction(rawTx, {
+        skipPreflight: false,
+        preflightCommitment: 'confirmed',
+        maxRetries: 3,
+      });
+
+      const confirmation = await conn.confirmTransaction(
+        {
+          signature,
+          blockhash: blockhash as string,
+          lastValidBlockHeight: lastValidBlockHeight as number,
+        },
+        'confirmed'
+      );
+
+      if (confirmation.value.err) {
+        throw new Error(
+          `Transaksi ${signature} gagal on-chain: ${JSON.stringify(
+            confirmation.value.err
+          )}`
+        );
+      }
+
+      await refreshSolBalance(conn, tx.feePayer);
+      return { signature, byteLength: rawTx.byteLength };
+    } catch (err) {
+      throw new Error(describeRpcError(err, conn.rpcEndpoint));
+    }
   };
 
   /**
@@ -438,6 +611,22 @@ export default function App(): React.ReactElement {
     const sdk = new CustomDefiSDK(activeConnection, DEFAULT_AMM_PROGRAM_ID);
 
     try {
+      // Guard devnet: tanpa SOL, transaksi pertama sudah gagal di preflight.
+      if (executionMode === 'DEVNET') {
+        const balance = await readSolBalance(devnetConnection, activePayer);
+        setSolBalance(balance);
+        if (balance === null) {
+          throw new Error(
+            `Tidak bisa membaca saldo dari ${DEVNET_RPC_HOST}. Periksa koneksi / ganti VITE_RPC_ENDPOINT.`
+          );
+        }
+        if (balance < MIN_DEVNET_SOL) {
+          throw new Error(
+            `Saldo devnet ${balance.toFixed(4)} SOL kurang dari ${MIN_DEVNET_SOL} SOL. Klik "Airdrop 1 SOL" (mock keypair) atau hubungkan Phantom yang punya SOL devnet.`
+          );
+        }
+      }
+
       const supplyRaw = parseTokenAmount(totalSupply, DEFAULT_TOKEN_DECIMALS);
       const virtualSolRaw = parseTokenAmount(
         virtualSolLiquidity,
@@ -480,7 +669,12 @@ export default function App(): React.ReactElement {
         tokenStandard,
       });
 
-      const cloneTx = new Transaction().add(...cloneResult.instructions);
+      const cloneTx = new Transaction().add(
+        ComputeBudgetProgram.setComputeUnitLimit({
+          units: CLONE_TX_COMPUTE_UNITS,
+        }),
+        ...cloneResult.instructions
+      );
       cloneTx.feePayer = activePayer;
       cloneTx.recentBlockhash = (
         await activeConnection.getLatestBlockhash('confirmed')
@@ -520,7 +714,11 @@ export default function App(): React.ReactElement {
         tokenProgramLp: TOKEN_2022_PROGRAM_ID,
       });
 
-      await signAndDispatch(createPoolResult.transaction, [], activeConnection);
+      await signAndDispatch(
+        withComputeBudget(createPoolResult.transaction, AMM_TX_COMPUTE_UNITS),
+        [],
+        activeConnection
+      );
 
       let realX = 0n;
       let realY = supplyRaw;
@@ -578,7 +776,11 @@ export default function App(): React.ReactElement {
           tokenProgramY: cloneResult.tokenProgramId,
         });
 
-        await signAndDispatch(swapBuild.transaction, [], activeConnection);
+        await signAndDispatch(
+          withComputeBudget(swapBuild.transaction, AMM_TX_COMPUTE_UNITS),
+          [],
+          activeConnection
+        );
         lastSwapHex = swapBuild.serializedIxData.toString('hex');
 
         realX += firstBuySolRaw;
@@ -730,6 +932,16 @@ export default function App(): React.ReactElement {
           : `Swap ${tradeAmountInput} $${ticker.toUpperCase()} -> SOL (Token-2022 transfer_checked)...`
       );
 
+      if (executionMode === 'DEVNET' && isBuy) {
+        const balance = await readSolBalance(devnetConnection, activeUser);
+        setSolBalance(balance);
+        if (balance !== null && balance < MIN_DEVNET_SOL) {
+          throw new Error(
+            `Saldo devnet ${balance.toFixed(4)} SOL tidak cukup untuk swap. Lakukan airdrop terlebih dahulu.`
+          );
+        }
+      }
+
       const swapBuild = await sdk.buildSwapTx({
         user: activeUser,
         tokenX: poolInfo.tokenX,
@@ -739,9 +951,15 @@ export default function App(): React.ReactElement {
         xToY: isBuy,
         tokenProgramX: poolInfo.tokenProgramX,
         tokenProgramY: poolInfo.tokenProgramY,
+        // Saat menjual, WSOL hasil swap dicairkan menjadi SOL native.
+        unwrapWsol: !isBuy,
       });
 
-      await signAndDispatch(swapBuild.transaction, [], activeConnection);
+      await signAndDispatch(
+        withComputeBudget(swapBuild.transaction, AMM_TX_COMPUTE_UNITS),
+        [],
+        activeConnection
+      );
 
       if (executionMode === 'SANDBOX') {
         const nextRealX = isBuy
@@ -819,6 +1037,7 @@ export default function App(): React.ReactElement {
                 Native <code className="text-emerald-400">TokenInterface</code>{' '}
                 + <code className="text-cyan-300">transfer_checked</code> &bull;
                 Zero External SDKs
+                {executionMode === 'DEVNET' && <> &bull; RPC {DEVNET_RPC_HOST}</>}
               </p>
             </div>
           </div>
@@ -827,7 +1046,10 @@ export default function App(): React.ReactElement {
             <div className="inline-flex rounded-lg border border-zinc-800 bg-zinc-900 p-0.5 text-xs">
               <button
                 type="button"
-                onClick={() => setExecutionMode('SANDBOX')}
+                onClick={() => {
+                  setExecutionMode('SANDBOX');
+                  setSolBalance(null);
+                }}
                 className={`rounded-md px-2.5 py-1 font-medium transition ${
                   executionMode === 'SANDBOX'
                     ? 'bg-zinc-800 text-emerald-400 shadow-sm'
@@ -838,7 +1060,13 @@ export default function App(): React.ReactElement {
               </button>
               <button
                 type="button"
-                onClick={() => setExecutionMode('DEVNET')}
+                onClick={() => {
+                  setExecutionMode('DEVNET');
+                  void refreshSolBalance(
+                    devnetConnection,
+                    walletPubkey ?? ephemeralKeypair.publicKey
+                  );
+                }}
                 className={`rounded-md px-2.5 py-1 font-medium transition ${
                   executionMode === 'DEVNET'
                     ? 'bg-zinc-800 text-cyan-400 shadow-sm'
@@ -879,6 +1107,27 @@ export default function App(): React.ReactElement {
                     className="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-xs font-medium text-zinc-200 transition hover:border-zinc-600"
                   >
                     Phantom
+                  </button>
+                )}
+              </div>
+            )}
+
+            {executionMode === 'DEVNET' && (
+              <div className="flex items-center gap-2">
+                <span
+                  className="rounded-lg border border-zinc-800 bg-zinc-900 px-2.5 py-1.5 font-mono text-xs text-zinc-300"
+                  title={`Saldo ${walletPubkey ? shortenAddress(walletPubkey.toBase58()) : 'wallet'} di ${DEVNET_RPC_HOST}`}
+                >
+                  {solBalance === null ? '— SOL' : `${solBalance.toFixed(4)} SOL`}
+                </span>
+                {walletType !== 'INJECTED' && (
+                  <button
+                    type="button"
+                    onClick={handleAirdrop}
+                    disabled={airdropBusy || isBusy}
+                    className="rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-2.5 py-1.5 text-xs font-medium text-cyan-300 transition hover:bg-cyan-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {airdropBusy ? 'Airdrop...' : 'Airdrop 1 SOL'}
                   </button>
                 )}
               </div>

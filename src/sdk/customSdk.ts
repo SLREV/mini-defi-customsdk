@@ -88,6 +88,7 @@ export const AMM_IX_DISCRIMINATOR = {
 
 const SPL_TOKEN_IX = {
   INITIALIZE_MINT: 0,
+  CLOSE_ACCOUNT: 9,
   MINT_TO_CHECKED: 14,
   SYNC_NATIVE: 17,
   INITIALIZE_MINT2: 20,
@@ -467,6 +468,11 @@ export interface SwapParams {
   xToY: boolean;
   tokenProgramX?: PublicKey;
   tokenProgramY?: PublicKey;
+  /**
+   * Hanya untuk swap Y -> X ketika Token X adalah WSOL. Default `true`: ATA WSOL ditutup
+   * (`CloseAccount`) setelah swap sehingga pengguna menerima **SOL native**, bukan WSOL.
+   */
+  unwrapWsol?: boolean;
   recentBlockhash?: string;
 }
 
@@ -475,6 +481,8 @@ export interface SwapBuildResult {
   instruction: TransactionInstruction;
   serializedIxData: Buffer;
   addresses: DerivedPoolAddresses;
+  /** `true` bila transaksi diakhiri `CloseAccount` untuk mencairkan WSOL menjadi SOL native */
+  unwrapWsol: boolean;
 }
 
 export interface DeserializedPoolInfo {
@@ -959,6 +967,30 @@ export class CustomDefiSDK {
     return new TransactionInstruction({
       programId: tokenProgramId,
       keys: [{ pubkey: wsolAta, isSigner: false, isWritable: true }],
+      data,
+    });
+  }
+
+  /**
+   * SPL Token / Token-2022 `CloseAccount` (ix 9, 1 byte).
+   * Dipakai untuk mencairkan seluruh saldo WSOL di ATA menjadi SOL native di `destination`.
+   */
+  public buildCloseAccountInstruction(
+    account: PublicKey,
+    destination: PublicKey,
+    owner: PublicKey,
+    tokenProgramId: PublicKey = TOKEN_PROGRAM_ID
+  ): TransactionInstruction {
+    const data = Buffer.alloc(SINGLE_U8_IX_LAYOUT.span);
+    SINGLE_U8_IX_LAYOUT.encode({ instruction: SPL_TOKEN_IX.CLOSE_ACCOUNT }, data);
+
+    return new TransactionInstruction({
+      programId: tokenProgramId,
+      keys: [
+        { pubkey: account, isSigner: false, isWritable: true },
+        { pubkey: destination, isSigner: false, isWritable: true },
+        { pubkey: owner, isSigner: true, isWritable: false },
+      ],
       data,
     });
   }
@@ -1560,6 +1592,29 @@ export class CustomDefiSDK {
     });
 
     transaction.add(instruction);
+
+    // Jual Token Y -> WSOL: tutup ATA WSOL agar pengguna menerima SOL native (unwrap).
+    const unwrapWsol =
+      params.unwrapWsol ?? (!params.xToY && tokenX.equals(NATIVE_SOL_MINT));
+    if (unwrapWsol) {
+      if (params.xToY) {
+        throw new Error(
+          'unwrapWsol hanya berlaku untuk swap Y -> X (menjual token ke WSOL)'
+        );
+      }
+      if (!tokenX.equals(NATIVE_SOL_MINT)) {
+        throw new Error('unwrapWsol hanya berlaku bila Token X adalah WSOL');
+      }
+      transaction.add(
+        this.buildCloseAccountInstruction(
+          userTokenX,
+          params.user,
+          params.user,
+          tokenProgramX
+        )
+      );
+    }
+
     transaction.feePayer = params.user;
     transaction.recentBlockhash =
       params.recentBlockhash ??
@@ -1570,6 +1625,7 @@ export class CustomDefiSDK {
       instruction,
       serializedIxData,
       addresses,
+      unwrapWsol,
     };
   }
 

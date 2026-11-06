@@ -78,6 +78,56 @@ anchor deploy    # Deploy program mini_amm ke devnet
 
 Mode **Binary Sandbox** di dashboard menjalankan seluruh pipeline (mint Token-2022 → inisialisasi pool → swap → deserialisasi 185B `PoolState`) terhadap ledger in-memory dengan serialisasi instruksi yang **sama persis** seperti transaksi on-chain; mode **Devnet RPC** mengirim transaksi sungguhan melalui wallet (Phantom atau keypair ephemeral).
 
+## Menjalankan di Devnet (Checklist)
+
+Mode **Devnet RPC** hanya bisa dipakai setelah 3 hal ini terpenuhi:
+
+1. **Program ter-deploy** pada program ID yang sama dengan `declare_id!` (`Csre71k9LDyYGx4t2hiG6VT4wiymuhPVXeksqe6Z83Hp`) di cluster devnet.
+2. **Wallet punya SOL devnet** (minimal ~0.1 SOL untuk fee + rent ATA/mint/pool).
+3. **RPC dapat diakses dari browser** (endpoint publik `api.devnet.solana.com` bisa kena rate-limit).
+
+```bash
+# 0. Toolchain
+#    Solana CLI + Anchor CLI 0.31.1 (avm install 0.31.1 && avm use 0.31.1)
+
+# 1. Wallet provider
+solana-keygen new -o ~/.config/solana/id.json   # jika belum punya
+solana config set --url devnet
+
+# 2. Pastikan program ID di Anchor.toml & declare_id! sinkron dengan keypair program
+anchor keys sync
+
+# 3. Build & deploy program ke devnet
+anchor build
+anchor deploy --provider.cluster devnet
+
+# 4. Verifikasi kesiapan devnet (RPC, program executable, saldo wallet)
+npm run devnet:check
+npm run devnet:check -- --airdrop     # minta 1 SOL devnet bila saldo kurang
+
+# 5. Jalankan dashboard, pilih mode "Devnet RPC"
+npm run dev
+```
+
+Tips pemakaian di dashboard:
+
+- Tanpa Phantom, klik **Connect Mock Keypair** lalu **Airdrop 1 SOL** (chip saldo di header menampilkan saldo `SOL` live).
+- Saldo < `0.05 SOL` akan ditolak lebih awal dengan pesan jelas, bukan gagal di tengah pipeline.
+- Transaksi mint Token-2022 dikirim dengan `ComputeBudgetProgram.setComputeUnitLimit` eksplisit (600k CU) karena alokasi + realloc TLV metadata bisa melewati default 200k CU.
+- Setiap transaksi diverifikasi dengan `confirmTransaction` yang memakai blockhash **yang sama** dengan yang ditandatangani, dan `err` hasil konfirmasi selalu dicek — transaksi gagal tidak akan dilaporkan sukses.
+- Saat menjual token, ATA WSOL ditutup (`CloseAccount`) sehingga Anda menerima **SOL native**, bukan WSOL.
+
+### Troubleshooting Devnet
+
+| Gejala | Penyebab & solusi |
+| :--- | :--- |
+| `Attempt to load a program that does not exist` | Program belum ter-deploy di devnet / program ID tidak sama dengan `declare_id!`. Jalankan `anchor keys sync` lalu `anchor deploy --provider.cluster devnet`. |
+| `Saldo SOL wallet tidak cukup…` | Klik **Airdrop 1 SOL** (mock keypair) atau hubungkan Phantom berisi SOL devnet, atau faucet.solana.com. |
+| `RPC … menolak karena rate-limit (429)` | Isi `VITE_RPC_ENDPOINT` di file `.env` (salin dari `.env.example`) dengan RPC devnet lain (Helius/QuickNode). |
+| `Airdrop gagal` | Rate limit faucet RPC publik — pakai faucet.solana.com atau RPC berbayar. |
+| `Blockhash kedaluwarsa` | Kirim ulang; pipeline selalu mengambil blockhash baru sebelum tanda tangan. |
+| Transaksi sukses tapi saldo token 0 | Cek `Telemetry → initialize_pool (17B)` dan pastikan program yang dipanggil adalah versi terbaru (`anchor upgrade` bila perlu). |
+
 ## Catatan Perbaikan Terakhir
 
 - Struktur file dipulihkan ke layout yang diharapkan tooling (`src/`, `tests/`, `programs/mini-amm/`) sehingga `tsc`, `npm test`, `npm run build`, dan `anchor build` berjalan.
@@ -88,3 +138,13 @@ Mode **Binary Sandbox** di dashboard menjalankan seluruh pipeline (mint Token-20
 - `buildCreatePoolTx()` kini membuat ATA token Y lebih dulu (sebelumnya transaksi gagal `AccountNotInitialized` bila pengguna belum punya ATA).
 - Dashboard: kegagalan swap tidak lagi ditandai `SUCCESS`, dan estimasi quote pembelian awal memakai cadangan efektif yang benar.
 - Uji tambahan: edge-case parser/matematika, ukuran transaksi, dan konsistensi `LP_awal = sqrt(k)`.
+
+### Perbaikan jalur Devnet
+
+- `signAndDispatch` sebelumnya mengambil blockhash **baru setelah** transaksi dikirim dan **tidak pernah memeriksa** `confirmation.value.err` → transaksi gagal dilaporkan sukses. Sekarang blockhash dipakai konsisten untuk sign + confirm dan `err` selalu dicek.
+- Pesan error RPC/preflight diterjemahkan (`program belum ter-deploy`, saldo kurang, rate-limit, blockhash kedaluwarsa, ditolak wallet) termasuk 3 log terakhir program.
+- Compute unit limit eksplisit untuk transaksi clone (600k CU) dan AMM (300k CU).
+- Guard saldo devnet (< 0.05 SOL ditolak lebih awal) + chip saldo + tombol **Airdrop 1 SOL** untuk wallet mock.
+- Endpoint RPC bisa dioverride via `VITE_RPC_ENDPOINT` (`.env.example`), host RPC ditampilkan di header.
+- Swap jual sekarang meng-unwrap WSOL → SOL native (`CloseAccount`, opsi `unwrapWsol` di SDK).
+- `scripts/devnetPreflight.ts` (`npm run devnet:check`): cek RPC, status program executable, saldo wallet, airdrop opsional, dan artefak `target/deploy/mini_amm.so`.

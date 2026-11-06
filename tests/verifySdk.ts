@@ -205,7 +205,8 @@ async function main(): Promise<void> {
   swapBuild.transaction.sign(payer);
   assert.ok(swapBuild.transaction.serialize().byteLength <= 1232);
 
-  // Swap arah sebaliknya (Token Y -> SOL) tidak boleh menyertakan transfer/SyncNative
+  // Swap arah sebaliknya (Token Y -> SOL): tanpa transfer/SyncNative, tetapi
+  // diakhiri CloseAccount agar WSOL dicairkan menjadi SOL native (unwrap).
   const sellBuild = await sdk.buildSwapTx({
     user: payer.publicKey,
     tokenX: NATIVE_SOL_MINT,
@@ -214,8 +215,42 @@ async function main(): Promise<void> {
     minAmountOut: 0n,
     xToY: false,
   });
-  assert.equal(sellBuild.transaction.instructions.length, 3);
+  assert.equal(sellBuild.transaction.instructions.length, 4);
   assert.equal(SWAP_IX_LAYOUT.decode(sellBuild.serializedIxData).xToY, 0);
+  assert.equal(sellBuild.unwrapWsol, true);
+  const closeIx = sellBuild.transaction.instructions[3];
+  assert.equal(closeIx.programId.toBase58(), TOKEN_PROGRAM_ID.toBase58());
+  assert.deepEqual(Array.from(closeIx.data), [9]); // CloseAccount
+  assert.equal(
+    closeIx.keys[0].pubkey.toBase58(),
+    sellBuild.transaction.instructions[0].keys[1].pubkey.toBase58() // ATA WSOL
+  );
+  sellBuild.transaction.sign(payer);
+  assert.ok(sellBuild.transaction.serialize().byteLength <= 1232);
+
+  // Opsi unwrap bisa dimatikan (mis. bila pengguna ingin menyimpan WSOL)
+  const sellNoUnwrap = await sdk.buildSwapTx({
+    user: payer.publicKey,
+    tokenX: NATIVE_SOL_MINT,
+    tokenY: clone.mint,
+    amountIn: 1_000_000_000n,
+    xToY: false,
+    unwrapWsol: false,
+  });
+  assert.equal(sellNoUnwrap.transaction.instructions.length, 3);
+  assert.equal(sellNoUnwrap.unwrapWsol, false);
+
+  // unwrapWsol tidak valid untuk arah beli
+  await assert.rejects(() =>
+    sdk.buildSwapTx({
+      user: payer.publicKey,
+      tokenX: NATIVE_SOL_MINT,
+      tokenY: clone.mint,
+      amountIn: 1_000_000_000n,
+      xToY: true,
+      unwrapWsol: true,
+    })
+  );
 
   // 7. Uji fetchPoolInfo() Deserialisasi Biner 185B + Vault Token-2022
   const initialLp = calculateInitialLpTokens(DEFAULT_VIRTUAL_SOL_LAMPORTS, supplyRaw);

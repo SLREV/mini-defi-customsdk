@@ -10,7 +10,8 @@
     "typecheck": "tsc --noEmit",
     "test": "tsx tests/verifySdk.ts",
     "anchor:build": "anchor build",
-    "anchor:deploy": "anchor deploy --provider.cluster devnet"
+    "anchor:deploy": "anchor deploy --provider.cluster devnet",
+    "devnet:check": "tsx scripts/devnetPreflight.ts"
   },
   "dependencies": {
     "@solana/buffer-layout": "^4.0.1",
