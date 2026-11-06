@@ -1,8 +1,11 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
+import { pinataDevApi } from './scripts/pinataDevApi';
 
 export default defineConfig({
-  plugins: [react()],
+  // pinataDevApi hanya aktif di dev server (apply: 'serve') dan membaca
+  // PINATA_JWT dari .env di sisi Node — secret tidak pernah masuk bundle browser.
+  plugins: [react(), pinataDevApi()],
   define: {
     global: 'globalThis',
   },
