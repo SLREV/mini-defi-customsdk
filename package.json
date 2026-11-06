@@ -19,7 +19,7 @@
     "devnet:check": "tsx scripts/devnetPreflight.ts",
     "pinata:upload": "tsx scripts/pinataUpload.ts",
     "pinata:check": "tsx scripts/pinataUpload.ts --check",
-    "claim:creator": "tsx scripts/claimCreatorFee.ts"
+    "claim:creator": "tsx --env-file-if-exists=.env scripts/claimCreatorFee.ts"
   },
   "dependencies": {
     "@solana/buffer-layout": "^4.0.1",

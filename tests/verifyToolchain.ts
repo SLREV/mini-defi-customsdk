@@ -17,7 +17,9 @@ import {
   encodeBase58,
   inspectToolchain,
   parseDeclareId,
+  parseSdkProgramId,
   pubkeyFromKeypairJson,
+  readEnvValue,
   MIN_SOLANA_VERSION,
   parsePlatformTools,
   parseSolanaVersion,
@@ -164,7 +166,55 @@ assert.equal(mm.programIdMismatch, true);
 assert.equal(mm.verdict, 'program-id-mismatch');
 assert.ok(mm.hints.some((h) => h.includes('PROGRAM ID TIDAK COCOK')));
 
-// 8. Repo asli: konfigurasi yang dikomit memang MSRV-aware
+// 8. Tiga sumber program ID: declare_id!, SDK, .env — dan skenario deploy nyata
+const realDeployed = 'DnW4iMWC5gCjPZkk2kkdTrY5uybW3w6r6aLdS6meynMn'; // dari `anchor deploy`
+const sdkSrc = `const AMM_PROGRAM_ID_OVERRIDE = (import.meta.env.VITE_AMM_PROGRAM_ID)?.trim();\n` +
+  `export const DEFAULT_AMM_PROGRAM_ID = new PublicKey(\n  AMM_PROGRAM_ID_OVERRIDE || '${realDeployed}'\n);\n`;
+assert.equal(parseSdkProgramId(sdkSrc), realDeployed);
+assert.equal(parseSdkProgramId('export const X = 1;'), null);
+
+// .env: hanya key yang diminta, komentar diabaikan, tanda kutip dibuang
+const envRoot = mkdtempSync(join(tmpdir(), 'doctor-env-'));
+writeFileSync(
+  join(envRoot, '.env'),
+  `# komentar\nVITE_RPC_ENDPOINT=https://api.devnet.solana.com\nVITE_AMM_PROGRAM_ID="${realDeployed}"\n`
+);
+assert.equal(readEnvValue(join(envRoot, '.env'), 'VITE_AMM_PROGRAM_ID'), realDeployed);
+assert.equal(readEnvValue(join(envRoot, '.env'), 'TIDAK_ADA'), null);
+assert.equal(readEnvValue(join(envRoot, 'tidak-ada.env'), 'VITE_AMM_PROGRAM_ID'), null);
+
+// Skenario nyata pengguna: keypair deploy baru (DnW4...) tapi SDK masih Csre71k9
+const scenarioRoot = mkdtempSync(join(tmpdir(), 'doctor-scenario-'));
+mkdirSync(join(scenarioRoot, 'programs', 'mini-amm', 'src'), { recursive: true });
+mkdirSync(join(scenarioRoot, 'src', 'sdk'), { recursive: true });
+mkdirSync(join(scenarioRoot, 'target', 'deploy'), { recursive: true });
+writeFileSync(
+  join(scenarioRoot, 'programs', 'mini-amm', 'src', 'lib.rs'),
+  'declare_id!("Csre71k9LDyYGx4t2hiG6VT4wiymuhPVXeksqe6Z83Hp");\n'
+);
+writeFileSync(join(scenarioRoot, 'Cargo.toml'), '[workspace]\nresolver = "2"\n');
+// SDK masih memakai ID lama, keypair deploy = ID baru hasil anchor build di folder ZIP
+writeFileSync(join(scenarioRoot, 'src', 'sdk', 'customSdk.ts'), sdkSrc.replace(realDeployed, 'Csre71k9LDyYGx4t2hiG6VT4wiymuhPVXeksqe6Z83Hp'));
+const deployedBytes = Uint8Array.from([...new Uint8Array(32).fill(3), ...seq]);
+writeFileSync(
+  join(scenarioRoot, 'target', 'deploy', 'mini_amm-keypair.json'),
+  JSON.stringify(Array.from(deployedBytes))
+);
+const sc = inspectToolchain(scenarioRoot);
+assert.equal(sc.deployKeypairPubkey, seqB58);
+assert.equal(sc.sdkProgramId, 'Csre71k9LDyYGx4t2hiG6VT4wiymuhPVXeksqe6Z83Hp');
+assert.equal(sc.envAmmProgramId, null);
+assert.equal(sc.programIdMismatch, true, 'SDK vs keypair deploy harus terdeteksi beda');
+assert.equal(sc.verdict, 'program-id-mismatch');
+
+// Setelah .env diisi ID hasil deploy, mismatch hilang
+writeFileSync(join(scenarioRoot, '.env'), `VITE_AMM_PROGRAM_ID=${seqB58}\n`);
+const fixed = inspectToolchain(scenarioRoot);
+assert.equal(fixed.envAmmProgramId, seqB58);
+assert.equal(fixed.programIdMismatch, false, 'setelah .env diisi, tidak boleh mismatch');
+assert.equal(fixed.declareIdStale, true, 'declare_id! masih lama -> harus diperingatkan');
+
+// 9. Repo asli: konfigurasi yang dikomit memang MSRV-aware
 const repoRoot = fileURLToPath(new URL('..', import.meta.url));
 const repo = inspectToolchain(repoRoot);
 assert.equal(repo.resolver, '2', 'Cargo.toml root wajib resolver = "2" (Anchor 0.31.1 menolak "3")');

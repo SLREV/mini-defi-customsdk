@@ -14,8 +14,34 @@ import * as BufferLayout from '@solana/buffer-layout';
 // KONSTANTA PROGRAM SOLANA & TOKEN-2022 (MURNI TANPA SDK PIHAK KETIGA)
 // ============================================================================
 
+/**
+ * Program ID AMM yang dipakai dashboard & seluruh script.
+ *
+ * Prioritas:
+ *   1. `VITE_AMM_PROGRAM_ID` dari `.env` — dipakai bila Anda men-deploy ke
+ *      program ID baru hasil `anchor keys sync` / build di folder tanpa
+ *      `target/deploy/mini_amm-keypair.json`.
+ *   2. Fallback default di bawah.
+ *
+ * `npm run toolchain:check` membandingkan nilai ini dengan `declare_id!` di
+ * `programs/mini-amm/src/lib.rs` dan pubkey di
+ * `target/deploy/mini_amm-keypair.json`, lalu menandai bila tidak cocok.
+ */
+function readProgramIdOverride(): string | undefined {
+  // Vite mengganti `import.meta.env` saat build browser.
+  // Di Node (tsx/CLI) `import.meta.env` tidak ada -> pakai process.env.
+  const fromVite = (
+    import.meta.env as { VITE_AMM_PROGRAM_ID?: string } | undefined
+  )?.VITE_AMM_PROGRAM_ID;
+  const fromNode =
+    typeof process !== 'undefined' ? process.env.VITE_AMM_PROGRAM_ID : undefined;
+  return (fromVite ?? fromNode)?.trim();
+}
+
+const AMM_PROGRAM_ID_OVERRIDE = readProgramIdOverride();
+
 export const DEFAULT_AMM_PROGRAM_ID = new PublicKey(
-  'Csre71k9LDyYGx4t2hiG6VT4wiymuhPVXeksqe6Z83Hp'
+  AMM_PROGRAM_ID_OVERRIDE || 'Csre71k9LDyYGx4t2hiG6VT4wiymuhPVXeksqe6Z83Hp'
 );
 
 /** SPL Token Legacy Program (digunakan oleh WSOL & USDC lama) */

@@ -94,6 +94,31 @@ export function encodeBase58(bytes: Uint8Array): string {
   return out;
 }
 
+/**
+ * Program ID default di `src/sdk/customSdk.ts` — dibaca dari fallback
+ * `AMM_PROGRAM_ID_OVERRIDE || '<pubkey>'`.
+ */
+export function parseSdkProgramId(sdkTs: string): string | null {
+  const m = sdkTs.match(/AMM_PROGRAM_ID_OVERRIDE\s*\|\|\s*'([1-9A-HJ-NP-Za-km-z]{32,44})'/);
+  return m ? m[1] : null;
+}
+
+/** Baca satu nilai dari file `.env` (`KEY=value`, abaikan komentar). */
+export function readEnvValue(envPath: string, key: string): string | null {
+  if (!existsSync(envPath)) {
+    return null;
+  }
+  for (const rawLine of readFileSync(envPath, 'utf8').split('\n')) {
+    const line = rawLine.trim();
+    if (line.startsWith('#') || !line.startsWith(`${key}=`)) {
+      continue;
+    }
+    const value = line.slice(key.length + 1).trim().replace(/^["']|["']$/g, '');
+    return value.length > 0 ? value : null;
+  }
+  return null;
+}
+
 /** Baca `declare_id!("...")` dari `programs/mini-amm/src/lib.rs`. */
 export function parseDeclareId(libRs: string): string | null {
   const m = libRs.match(/declare_id!\s*\(\s*"(\w+)"\s*\)/);
@@ -136,8 +161,14 @@ export interface ToolchainReport {
   declareId: string | null;
   /** Pubkey dari target/deploy/mini_amm-keypair.json (yang benar-benar di-deploy). */
   deployKeypairPubkey: string | null;
-  /** true bila deploy akan memakai program ID berbeda dari declare_id!. */
+  /** Program ID yang dipanggil dashboard/SDK (VITE_AMM_PROGRAM_ID atau isi customSdk.ts). */
+  sdkProgramId: string | null;
+  /** Nilai VITE_AMM_PROGRAM_ID di .env (null bila tidak ada). */
+  envAmmProgramId: string | null;
+  /** true bila program yang dipanggil dashboard berbeda dari keypair deploy. */
   programIdMismatch: boolean;
+  /** true bila declare_id! tidak sama dengan program ID yang dipanggil dashboard. */
+  declareIdStale: boolean;
   binary: string | null;
   hints: string[];
 }
@@ -219,14 +250,26 @@ export function inspectToolchain(root = process.cwd()): ToolchainReport {
   const declareId = existsSync(libRsPath)
     ? parseDeclareId(readFileSync(libRsPath, 'utf8'))
     : null;
+  // Program ID yang benar-benar dipanggil dashboard & script.
+  const sdkPath = join(root, 'src', 'sdk', 'customSdk.ts');
+  const sdkProgramId = existsSync(sdkPath)
+    ? parseSdkProgramId(readFileSync(sdkPath, 'utf8'))
+    : null;
+  const envAmmProgramId = readEnvValue(join(root, '.env'), 'VITE_AMM_PROGRAM_ID');
+  // .env menang, lalu default SDK, terakhir declare_id! (repo tanpa SDK).
+  const effectiveProgramId = envAmmProgramId ?? sdkProgramId ?? declareId;
   const keypairJsonPath = join(root, 'target', 'deploy', 'mini_amm-keypair.json');
   const deployKeypairPubkey = existsSync(keypairJsonPath)
     ? pubkeyFromKeypairJson(readFileSync(keypairJsonPath, 'utf8'))
     : null;
   const programIdMismatch =
-    declareId !== null &&
+    effectiveProgramId !== null &&
     deployKeypairPubkey !== null &&
-    declareId !== deployKeypairPubkey;
+    effectiveProgramId !== deployKeypairPubkey;
+  const declareIdStale =
+    declareId !== null &&
+    effectiveProgramId !== null &&
+    declareId !== effectiveProgramId;
 
   const deployDir = join(root, 'target', 'deploy');
   const binary = existsSync(join(deployDir, 'mini_amm.so'))
@@ -272,13 +315,29 @@ export function inspectToolchain(root = process.cwd()): ToolchainReport {
   if (programIdMismatch) {
     verdict = 'program-id-mismatch';
     hints.push(
-      'PROGRAM ID TIDAK COCOK: declare_id! = ' +
-        `${declareId}, tetapi target/deploy/mini_amm-keypair.json = ${deployKeypairPubkey}.`
+      'PROGRAM ID TIDAK COCOK: yang dipanggil dashboard/SDK = ' +
+        `${effectiveProgramId}` +
+        (envAmmProgramId ? ' (dari .env VITE_AMM_PROGRAM_ID)' : ' (dari src/sdk/customSdk.ts)') +
+        `, tetapi target/deploy/mini_amm-keypair.json = ${deployKeypairPubkey}.`
     );
     hints.push(
-      'anchor deploy memakai keypair itu, jadi program akan mendarat di alamat yang ' +
-        'BUKAN dipanggil dashboard/scripts (declare_id!). Jalankan `anchor keys sync` ' +
-        'lalu `anchor clean && anchor build` ULANG sebelum deploy.'
+      'anchor deploy memakai keypair itu, jadi program mendarat di alamat yang BUKAN ' +
+        'dipanggil dashboard/scripts. Pilih salah satu:'
+    );
+    hints.push(
+      `  (a) ikuti keypair deploy: set VITE_AMM_PROGRAM_ID=${deployKeypairPubkey} di .env, ` +
+        'samakan [programs.*] di Anchor.toml + declare_id! (anchor keys sync), lalu rebuild.'
+    );
+    hints.push(
+      '  (b) paksa alamat lama: taruh keypair program yang benar di ' +
+        'target/deploy/mini_amm-keypair.json, lalu `anchor clean && anchor build`.'
+    );
+  }
+
+  if (declareIdStale && !programIdMismatch) {
+    hints.push(
+      `declare_id! (${declareId}) berbeda dari program ID yang dipanggil dashboard (${effectiveProgramId}). ` +
+        'Jalankan `anchor keys sync` lalu `anchor clean && anchor build` agar binary dan SDK sepakat.'
     );
   }
 
@@ -320,8 +379,11 @@ export function inspectToolchain(root = process.cwd()): ToolchainReport {
     msrvAwareResolver,
     anchorManifestIncompatible,
     declareId,
+    sdkProgramId,
+    envAmmProgramId,
     deployKeypairPubkey,
     programIdMismatch,
+    declareIdStale,
     binary,
     hints,
   };
@@ -365,6 +427,10 @@ function main(): void {
     `Resolver MSRV   : ${report.msrvAwareResolver ? 'aktif' : `belum (resolver=${report.resolver ?? '-'})`}`
   );
   console.log(`declare_id!     : ${report.declareId ?? 'tidak terbaca'}`);
+  console.log(
+    `SDK / .env      : ${report.envAmmProgramId ?? report.sdkProgramId ?? 'tidak terbaca'}` +
+      (report.envAmmProgramId ? ' (dari .env)' : ' (dari customSdk.ts)')
+  );
   console.log(
     `deploy keypair  : ${report.deployKeypairPubkey ?? 'belum ada (dibuat saat build pertama)'}`
   );
