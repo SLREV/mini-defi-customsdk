@@ -41,7 +41,7 @@ function readProgramIdOverride(): string | undefined {
 const AMM_PROGRAM_ID_OVERRIDE = readProgramIdOverride();
 
 export const DEFAULT_AMM_PROGRAM_ID = new PublicKey(
-  AMM_PROGRAM_ID_OVERRIDE || 'Csre71k9LDyYGx4t2hiG6VT4wiymuhPVXeksqe6Z83Hp'
+  AMM_PROGRAM_ID_OVERRIDE || 'DnW4iMWC5gCjPZkk2kkdTrY5uybW3w6r6aLdS6meynMn'
 );
 
 /** SPL Token Legacy Program (digunakan oleh WSOL & USDC lama) */

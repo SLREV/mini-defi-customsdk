@@ -23,6 +23,11 @@ import {
   PublicKey,
 } from '@solana/web3.js';
 import { DEFAULT_AMM_PROGRAM_ID } from '../src/sdk/customSdk';
+import {
+  encodeBase58,
+  parseDeclareId,
+  pubkeyFromKeypairJson,
+} from './toolchainDoctor';
 
 const UPGRADEABLE_LOADER_ID = new PublicKey(
   'BPFLoaderUpgradeab1e11111111111111111111111'
@@ -54,6 +59,28 @@ const pass = (label: string, detail: string): void => {
 const fail = (label: string, detail: string, fatal = false): void => {
   results.push({ ok: false, label, detail, fatal });
   console.log(`  ${fatal ? '\u2716' : '\u26a0'} ${label}\n      ${detail}`);
+};
+
+/**
+ * Pubkey efektif program untuk akun Program milik upgradeable loader.
+ *
+ * Akun `Program` berisi: u32 tag(2) + 32 byte address ProgramData.
+ * ProgramData berisi: u32 tag(3) + u64 slot + Option<Pubkey> upgrade_authority
+ *                      + Pubkey programdata_address ... dan TIDAK menyimpan
+ *                      program id-nya sendiri. Karena itu kecocokan ID dibuktikan
+ *                      lewat `declare_id!` di source vs program id yang dipanggil,
+ *                      bukan lewat data akun.
+ */
+const describeProgramAccount = (data: Buffer): string => {
+  if (data.byteLength < 36) {
+    return `data ${data.byteLength} byte`;
+  }
+  const tag = data.readUInt32LE(0);
+  if (tag !== 2) {
+    return `tag ${tag} (bukan Program)`;
+  }
+  const programData = encodeBase58(data.subarray(4, 36));
+  return `ProgramData ${programData.slice(0, 8)}\u2026`;
 };
 
 const loadWallet = (): Keypair | null => {
@@ -129,8 +156,52 @@ async function main(): Promise<void> {
             : accountInfo.owner.toBase58();
       pass(
         'Program AMM ter-deploy & executable',
-        `${loader} \u00b7 data ${accountInfo.data.byteLength} byte`
+        `${loader} \u00b7 data ${accountInfo.data.byteLength} byte \u00b7 ${describeProgramAccount(
+          Buffer.from(accountInfo.data)
+        )}`
       );
+
+      // Cek kecocokan declare_id! dengan program id yang dipanggil dashboard.
+      // Kalau beda, Anchor menolak SEMUA instruksi dengan 4100
+      // (DeclaredProgramIdMismatch / custom error 0x1004).
+      const libRsPath = resolve('programs/mini-amm/src/lib.rs');
+      const declared = existsSync(libRsPath)
+        ? parseDeclareId(readFileSync(libRsPath, 'utf8'))
+        : null;
+      if (declared === null) {
+        fail(
+          'declare_id! tidak terbaca',
+          `${libRsPath} tidak ditemukan atau tidak memuat declare_id!`
+        );
+      } else if (declared !== DEFAULT_AMM_PROGRAM_ID.toBase58()) {
+        fail(
+          'declare_id! TIDAK SAMA dengan program yang dipanggil dashboard',
+          [
+            `declare_id! di source : ${declared}`,
+            `program yang dipanggil : ${DEFAULT_AMM_PROGRAM_ID.toBase58()}`,
+            'Anchor akan menolak setiap instruksi dengan 4100 / 0x1004 (DeclaredProgramIdMismatch).',
+            'Perbaiki: samakan declare_id! dengan alamat deploy, lalu',
+            '  anchor build && anchor upgrade --program-id ' +
+              `${DEFAULT_AMM_PROGRAM_ID.toBase58()} target/deploy/mini_amm.so`,
+          ].join('\n      '),
+          true
+        );
+      } else {
+        pass('declare_id! cocok dengan program ID dashboard', declared);
+      }
+
+      // Pubkey di keypair deploy lokal (kalau ada) juga harus sama.
+      const keypairPath = resolve('target/deploy/mini_amm-keypair.json');
+      if (existsSync(keypairPath)) {
+        const localPubkey = pubkeyFromKeypairJson(readFileSync(keypairPath, 'utf8'));
+        if (localPubkey && localPubkey !== DEFAULT_AMM_PROGRAM_ID.toBase58()) {
+          fail(
+            'keypair deploy lokal menunjuk program ID lain',
+            `${localPubkey} \u2260 ${DEFAULT_AMM_PROGRAM_ID.toBase58()}. ` +
+              'Jalankan `anchor keys sync` lalu build ulang sebelum deploy.'
+          );
+        }
+      }
     }
   } catch (err) {
     fail(

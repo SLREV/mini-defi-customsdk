@@ -5,7 +5,7 @@
  * Tidak butuh Rust/Solana: seluruh parsing diuji terhadap string output nyata.
  */
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -214,9 +214,39 @@ assert.equal(fixed.envAmmProgramId, seqB58);
 assert.equal(fixed.programIdMismatch, false, 'setelah .env diisi, tidak boleh mismatch');
 assert.equal(fixed.declareIdStale, true, 'declare_id! masih lama -> harus diperingatkan');
 
-// 9. Repo asli: konfigurasi yang dikomit memang MSRV-aware
-const repoRoot = fileURLToPath(new URL('..', import.meta.url));
-const repo = inspectToolchain(repoRoot);
+// 9. Semua deklarasi program ID di repo harus menunjuk alamat yang SAMA.
+//    Kalau tidak, Anchor menolak semua instruksi dengan 4100 / 0x1004.
+const REPO = fileURLToPath(new URL('..', import.meta.url));
+const repoDeclareId = parseDeclareId(
+  readFileSync(join(REPO, 'programs', 'mini-amm', 'src', 'lib.rs'), 'utf8')
+);
+const repoAnchorToml = readFileSync(join(REPO, 'Anchor.toml'), 'utf8');
+const anchorTomlIds = [...repoAnchorToml.matchAll(/mini_amm = "([1-9A-HJ-NP-Za-km-z]+)"/g)].map(
+  (m) => m[1]
+);
+assert.ok(repoDeclareId, 'declare_id! harus terbaca');
+assert.equal(anchorTomlIds.length, 2, 'Anchor.toml harus punya entri localnet + devnet');
+for (const id of anchorTomlIds) {
+  assert.equal(
+    id,
+    repoDeclareId,
+    `Anchor.toml (${id}) harus sama dengan declare_id! (${repoDeclareId})`
+  );
+}
+const repoReport = inspectToolchain(REPO);
+assert.equal(
+  repoReport.deployKeypairPubkey,
+  null,
+  'repo tanpa target/deploy tidak boleh melaporkan keypair'
+);
+assert.equal(
+  repoReport.programIdMismatch,
+  false,
+  'tanpa target/deploy tidak boleh ada mismatch palsu'
+);
+
+// 10. Repo asli: konfigurasi yang dikomit memang MSRV-aware
+const repo = inspectToolchain(REPO);
 assert.equal(repo.resolver, '2', 'Cargo.toml root wajib resolver = "2" (Anchor 0.31.1 menolak "3")');
 assert.equal(
   repo.anchorManifestIncompatible,

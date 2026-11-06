@@ -309,7 +309,9 @@ Mode **Binary Sandbox** di dashboard menjalankan seluruh pipeline (mint Token-20
 
 Mode **Devnet RPC** hanya bisa dipakai setelah 3 hal ini terpenuhi:
 
-1. **Program ter-deploy** pada program ID yang sama dengan `declare_id!` (`Csre71k9LDyYGx4t2hiG6VT4wiymuhPVXeksqe6Z83Hp`) di cluster devnet.
+1. **Program ter-deploy** pada program ID yang sama dengan `declare_id!`
+   (`DnW4iMWC5gCjPZkk2kkdTrY5uybW3w6r6aLdS6meynMn`) di cluster devnet, dan binary-nya
+   dikompilasi dengan ID tersebut (kalau tidak → `DeclaredProgramIdMismatch` / `0x1004`).
 2. **Wallet punya SOL devnet** (minimal ~0.1 SOL untuk fee + rent ATA/mint/pool).
 3. **RPC dapat diakses dari browser** (endpoint publik `api.devnet.solana.com` bisa kena rate-limit).
 
@@ -376,7 +378,8 @@ Selain itu dashboard mencetak ringkasan layout transaksi ke console (`console.ta
 | :--- | :--- |
 | `feature \`edition2024\` is required` saat `anchor build` | Cargo bawaan toolchain SBF masih 1.84. Lihat bagian **Gagal `anchor build`: feature `edition2024`** di bawah. |
 | `unknown variant \`3\`, expected \`1\` or \`2\`` | `resolver = "3"` di `Cargo.toml` — ditolak Anchor 0.31.1. Pakai `resolver = "2"` dan aktifkan MSRV-aware lewat `.cargo/config.toml`. |
-| `Attempt to load a program that does not exist` padahal deploy "sukses" | Program ter-deploy di program ID lain (keypair di `target/deploy` baru dibuat). Set `VITE_AMM_PROGRAM_ID=<Program Id dari deploy>` di `.env` — atau `anchor keys sync` + `anchor clean && anchor build` + deploy ulang. Cek dengan `npm run toolchain:check`. |
+| `Attempt to load a program that does not exist` padahal deploy "sukses" | Dashboard memanggil alamat yang salah. Set `VITE_AMM_PROGRAM_ID=<Program Id dari deploy>` di `.env`, atau `anchor keys sync` + rebuild + deploy ulang. Cek `npm run toolchain:check`. |
+| `DeclaredProgramIdMismatch` / `0x1004` saat kirim transaksi | Binary dikompilasi untuk `declare_id!` berbeda dari alamat deploy. Samakan `declare_id!` lalu `anchor build && anchor upgrade --program-id <ID> target/deploy/mini_amm.so`. `npm run devnet:check` mendeteksi ini sebelum transaksi dikirim. |
 | `cargo-build-sbf` masih melaporkan rustc 1.84 setelah install Agave baru | Binary lama menang di `PATH`. Cek `which -a cargo-build-sbf`, pastikan `~/.local/share/solana/install/active_release/bin` ada di depan. |
 | `Downloading platform-tools v1.57 ... (506 MiB)` | Normal, sekali saja. `cargo-build-sbf` versi baru mengunduh toolchain SBF pertama kali dipakai. Jangan dihentikan. |
 | `warning: This cargo-build-sbf was installed with the Solana CLI` | Tidak berbahaya — itu `cargo-build-sbf` baru yang menyadari ada binary lain di `~/.cargo/bin`. Lihat catatan `PATH` di bagian edition2024. |
@@ -507,78 +510,79 @@ Skrip ini membaca `cargo-build-sbf --version`, membandingkan rustc dengan ambang
 memeriksa `solana_version` di `Anchor.toml` serta status resolver MSRV, dan memberi tahu
 apakah `target/deploy/mini_amm.so` sudah ada.
 
-## Sebelum `anchor deploy`: pastikan program ID cocok
+## Program ID: `declare_id!` harus sama dengan alamat deploy
 
-`anchor deploy` **tidak** memakai `declare_id!`. Ia memakai keypair di
-`target/deploy/mini_amm-keypair.json`:
+Ada **dua** kegagalan berbeda yang berakar pada hal yang sama, dan keduanya sudah pernah
+terjadi di repo ini:
+
+| Gejala | Arti |
+| :--- | :--- |
+| `Attempt to load a program that does not exist` | Dashboard memanggil alamat X, program tidak ada di X |
+| `DeclaredProgramIdMismatch` (Anchor **4100**, custom error **0x1004**) | Program **ada**, tetapi binary-nya dikompilasi untuk ID lain |
+
+### Kenapa `0x1004` muncul
+
+Anchor menanam `declare_id!` ke dalam binary dan memeriksanya di **baris pertama** setiap
+instruksi (`lang/syn/src/codegen/program/entry.rs`):
 
 ```rust
-None => (program.keypair_file()?.path().to_string(), program.pubkey()?),
+if *program_id != ID {
+    return Err(anchor_lang::error::ErrorCode::DeclaredProgramIdMismatch.into());
+}
 ```
 
-Dan `keypair_file()` (Anchor 0.31.1, `cli/src/config.rs`) **membuat keypair acak baru** kalau
-file itu belum ada. Jadi kalau `target/deploy/` baru dibuat (mis. setelah `anchor clean`
-atau karena folder proyek hasil ZIP), build akan memakai program ID baru — sementara
-`declare_id!`, dashboard, dan `npm run claim:creator` tetap memanggil
-`Csre71k9LDyYGx4t2hiG6VT4wiymuhPVXeksqe6Z83Hp`. Akibatnya semua transaksi gagal dengan
-`Attempt to load a program that does not exist`.
+Jadi kalau binary dengan `declare_id!("A")` di-deploy ke alamat `B`, **semua** instruksi
+ditolak — bukan hanya sebagian. Log-nya:
 
-### Urutan yang benar
+```
+Program log: AnchorError occurred. Error Code: DeclaredProgramIdMismatch.
+          Error Number: 4100. Error Message: The declared program id does not match the actual program id.
+```
+
+Penyebab paling umum: `anchor build` di folder tanpa `target/deploy/mini_amm-keypair.json`
+(ZIP / setelah `anchor clean`) membuat keypair **baru**, sehingga `anchor deploy` mendarat di
+alamat baru sementara `declare_id!` masih alamat lama.
+
+### Perbaikan untuk program yang sudah ter-deploy di ID lain
+
+Pakai ID yang **sudah** ter-deploy (jangan deploy baru). `anchor upgrade` mempertahankan
+program ID karena ia memanggil `solana program deploy --program-id <ID>`:
 
 ```bash
-# 1. Cek dulu — toolchain:check membandingkan declare_id! dengan keypair deploy
-npm run toolchain:check
-#    Status : ✖ PROGRAM ID TIDAK COCOK   -> berarti keypair baru dibuat
+# 1. Samakan declare_id! (dan Anchor.toml / SDK) ke alamat yang sudah ter-deploy
+#    di repo ini semuanya sudah disetel ke:
+#    DnW4iMWC5gCjPZkk2kkdTrY5uybW3w6r6aLdS6meynMn
 
-# 2. Kalau mismatch: samakan
-anchor keys sync      # declare_id! + Anchor.toml ikut keypair di target/deploy
-anchor clean && anchor build   # WAJIB build ulang, binary meng-embed program ID lama
+# 2. Verifikasi semuanya sepakat
+npm run toolchain:check     # declare_id!, SDK/.env, dan keypair deploy
+npm run devnet:check        # cek jaringan: declare_id! vs akun program on-chain
 
-# 3. Baru deploy
+# 3. Build ulang (binary harus meng-embed ID yang benar)
+anchor clean && anchor build
+
+# 4. Kirim binary baru ke program ID yang sama
+anchor upgrade --program-id DnW4iMWC5gCjPZkk2kkdTrY5uybW3w6r6aLdS6meynMn \
+  target/deploy/mini_amm.so
+```
+
+Setelah itu `npm run dev` → mode **Devnet RPC** siap dipakai.
+
+> Kalau Anda ingin memakai alamat lain lagi: ubah **empat** tempat sekaligus —
+> `declare_id!` di `programs/mini-amm/src/lib.rs`, dua entri di `[programs.*]` `Anchor.toml`,
+> fallback di `src/sdk/customSdk.ts` (atau `VITE_AMM_PROGRAM_ID` di `.env`), lalu
+> `anchor clean && anchor build`. `npm run toolchain:check` akan menandai kalau ada yang
+> tertinggal.
+
+### Kalau memilih deploy baru (bukan upgrade)
+
+```bash
+anchor keys sync      # declare_id! + Anchor.toml ikut target/deploy
+anchor clean && anchor build
 anchor deploy --provider.cluster devnet
 ```
 
-> `anchor keys sync` mengubah dua tempat: `declare_id!` di `programs/mini-amm/src/lib.rs`
-> dan `[programs.devnet]` di `Anchor.toml`. Setelah itu **wajib build ulang**
-> (`anchor clean && anchor build`) — kalau tidak, `.so` masih meng-embed program ID lama dan
-> `claim:creator` / dashboard akan menembak alamat yang salah.
-
-### Kalau program sudah ter-deploy di ID lain (kasus paling umum)
-
-Gejalanya: `anchor deploy` mencetak `Program Id: DnW4iMWC5...` — berbeda dari
-`Csre71k9LDyYGx4t2hiG6VT4wiymuhPVXeksqe6Z83Hp`. Ini terjadi kalau build dijalankan di folder
-tanpa `target/deploy/mini_amm-keypair.json` (ZIP/`anchor clean`), sehingga Anchor membuat
-keypair program baru.
-
-Cara tercepat — **ikuti ID yang sudah ter-deploy**, cukup satu baris di `.env`:
-
-```bash
-cp .env.example .env          # kalau belum ada
-echo 'VITE_AMM_PROGRAM_ID=DnW4iMWC5gCjPZkk2kkdTrY5uybW3w6r6aLdS6meynMn' >> .env
-npm run toolchain:check       # status harus bukan "PROGRAM ID TIDAK COCOK"
-npm run dev                   # dashboard kini memanggil ID yang benar
-```
-
-`VITE_AMM_PROGRAM_ID` juga dibaca oleh CLI lewat `process.env`. `npm run claim:creator`
-sudah memuat `.env` otomatis (`tsx --env-file-if-exists=.env`); untuk script lain jalankan
-dengan `tsx --env-file=.env ...` atau `export VITE_AMM_PROGRAM_ID=...` lebih dulu.
-`npm run toolchain:check` menampilkan sumber yang sedang dipakai
-(`SDK / .env : ... (dari .env)`), jadi mudah diverifikasi.
-
-Untuk konsistensi jangka panjang, samakan juga `declare_id!` + `[programs.*]`:
-
-```bash
-anchor keys sync              # declare_id! & Anchor.toml ikut target/deploy
-anchor clean && anchor build  # binary meng-embed ID baru
-anchor deploy --provider.cluster devnet   # deploy ulang (atau `anchor upgrade` bila perlu)
-```
-
-### Kalau ingin tetap memakai `Csre71k9...`
-
-Salin keypair program yang benar ke `target/deploy/mini_amm-keypair.json` **sebelum** build,
-lalu `anchor clean && anchor build`. Keypair asli pemilik `Csre71k9...` hanya ada di mesin
-yang dulu meng-generate ID tersebut; kalau tidak punya, pakai jalur `VITE_AMM_PROGRAM_ID`
-di atas.
+Ingat: `anchor keys sync` **mengubah** `declare_id!`, jadi build ulang wajib — kalau tidak,
+binary lama tetap meng-embed ID lama dan `0x1004` muncul lagi.
 
 ## Catatan Perbaikan Terakhir
 
