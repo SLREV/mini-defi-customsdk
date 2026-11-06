@@ -9,6 +9,7 @@ import {
 import {
   ADD_LIQUIDITY_IX_LAYOUT,
   ASSOCIATED_TOKEN_PROGRAM_ID,
+  CLAIM_CREATOR_FEE_IX_LAYOUT,
   CREATE_POOL_IX_LAYOUT,
   CustomDefiSDK,
   DEFAULT_AMM_PROGRAM_ID,
@@ -26,6 +27,7 @@ import {
   TOKEN_METADATA_INITIALIZE_DISCRIMINATOR,
   TOKEN_METADATA_UPDATE_FIELD_DISCRIMINATOR,
   TOKEN_PROGRAM_ID,
+  calculateCreatorFee,
   calculateInitialLpTokens,
   calculateSwapOutput,
   calculateToken2022MintTotalBytes,
@@ -76,9 +78,9 @@ async function main(): Promise<void> {
   const sdk = new CustomDefiSDK(conn, DEFAULT_AMM_PROGRAM_ID);
   const payer = Keypair.generate();
 
-  // 1. Verifikasi ukuran PoolStateLayout = 185 bytes
-  assert.equal(PoolStateLayout.span, 185);
-  assert.equal(POOL_STATE_SIZE, 185);
+  // 1. Verifikasi ukuran PoolStateLayout = 281 bytes (PoolState v2 + fee creator)
+  assert.equal(PoolStateLayout.span, 281);
+  assert.equal(POOL_STATE_SIZE, 281);
 
   // 2. Uji presisi 9 desimal BigInt (1 Milyar Token-2022 = 10^18 > MAX_SAFE_INTEGER)
   const supplyRaw = parseTokenAmount('1000000000', 9);
@@ -211,14 +213,23 @@ async function main(): Promise<void> {
   });
 
   assert.equal(createPool.serializedIxData.byteLength, 17);
-  assert.equal(createPool.instruction.keys.length, 15);
+  assert.equal(createPool.instruction.keys.length, 17);
   // Pastikan token_program_x = SPL Legacy (WSOL) & token_program_y = Token-2022
+  // fee vault creator di indeks 7 & 8 (setelah vault_x / vault_y)
   assert.equal(
-    createPool.instruction.keys[9].pubkey.toBase58(),
+    createPool.instruction.keys[7].pubkey.toBase58(),
+    createPool.addresses.feeVaultX.toBase58()
+  );
+  assert.equal(
+    createPool.instruction.keys[8].pubkey.toBase58(),
+    createPool.addresses.feeVaultY.toBase58()
+  );
+  assert.equal(
+    createPool.instruction.keys[11].pubkey.toBase58(),
     TOKEN_PROGRAM_ID.toBase58()
   );
   assert.equal(
-    createPool.instruction.keys[10].pubkey.toBase58(),
+    createPool.instruction.keys[12].pubkey.toBase58(),
     TOKEN_2022_PROGRAM_ID.toBase58()
   );
 
@@ -276,7 +287,18 @@ async function main(): Promise<void> {
     xToY: true,
   });
   assert.equal(swapBuild.serializedIxData.byteLength, 18);
-  assert.equal(swapBuild.instruction.keys.length, 10);
+  assert.equal(swapBuild.instruction.keys.length, 12);
+  // fee vault creator ikut dikirim di indeks 6 & 7 (setelah vault_x / vault_y)
+  assert.equal(
+    swapBuild.instruction.keys[6].pubkey.toBase58(),
+    swapBuild.addresses.feeVaultX.toBase58()
+  );
+  assert.equal(
+    swapBuild.instruction.keys[7].pubkey.toBase58(),
+    swapBuild.addresses.feeVaultY.toBase58()
+  );
+  assert.equal(swapBuild.instruction.keys[6].isWritable, true);
+  assert.equal(swapBuild.instruction.keys[7].isWritable, true);
   assert.equal(SWAP_IX_LAYOUT.decode(swapBuild.serializedIxData).discriminator, 2);
   // 2 ATA idempotent + transfer SOL + SyncNative + swap
   assert.equal(swapBuild.transaction.instructions.length, 5);
@@ -334,7 +356,7 @@ async function main(): Promise<void> {
     })
   );
 
-  // 7. Uji fetchPoolInfo() Deserialisasi Biner 185B + Vault Token-2022
+  // 7. Uji fetchPoolInfo() Deserialisasi Biner 281B + Vault Token-2022 + Fee Vault
   const initialLp = calculateInitialLpTokens(DEFAULT_VIRTUAL_SOL_LAMPORTS, supplyRaw);
   // Cadangan efektif = vault.amount + virtual_reserves, dengan virtual_reserves_y = 0.
   const swapOut5Sol = calculateSwapOutput(
@@ -352,6 +374,9 @@ async function main(): Promise<void> {
       vaultX: createPool.addresses.vaultX,
       vaultY: createPool.addresses.vaultY,
       lpMint: createPool.addresses.lpMint,
+      creator: payer.publicKey,
+      feeVaultX: createPool.addresses.feeVaultX,
+      feeVaultY: createPool.addresses.feeVaultY,
       virtualReservesX: DEFAULT_VIRTUAL_SOL_LAMPORTS,
       virtualReservesY: 0n,
       bump: createPool.addresses.poolBump,
@@ -437,6 +462,58 @@ async function main(): Promise<void> {
     rentEpoch: 0,
   });
 
+  // Fee vault creator (hasil akumulasi 0.06% dari swap 5 SOL di atas)
+  const accruedCreatorFeeX = calculateCreatorFee(5_000_000_000n);
+  const feeVaultXBuf = Buffer.alloc(SPL_TOKEN_ACCOUNT_SIZE);
+  SPL_TOKEN_ACCOUNT_LAYOUT.encode(
+    {
+      mint: NATIVE_SOL_MINT,
+      owner: createPool.addresses.poolState,
+      amount: accruedCreatorFeeX,
+      delegateOption: 0,
+      delegate: PublicKey.default,
+      state: 1,
+      isNativeOption: 1,
+      isNative: 2_039_280n,
+      delegatedAmount: 0n,
+      closeAuthorityOption: 0,
+      closeAuthority: PublicKey.default,
+    },
+    feeVaultXBuf
+  );
+  conn.ledger.set(createPool.addresses.feeVaultX.toBase58(), {
+    data: feeVaultXBuf,
+    executable: false,
+    lamports: 2_039_280,
+    owner: TOKEN_PROGRAM_ID,
+    rentEpoch: 0,
+  });
+
+  const feeVaultYBuf = Buffer.alloc(SPL_TOKEN_ACCOUNT_SIZE);
+  SPL_TOKEN_ACCOUNT_LAYOUT.encode(
+    {
+      mint: clone.mint,
+      owner: createPool.addresses.poolState,
+      amount: 0n,
+      delegateOption: 0,
+      delegate: PublicKey.default,
+      state: 1,
+      isNativeOption: 0,
+      isNative: 0n,
+      delegatedAmount: 0n,
+      closeAuthorityOption: 0,
+      closeAuthority: PublicKey.default,
+    },
+    feeVaultYBuf
+  );
+  conn.ledger.set(createPool.addresses.feeVaultY.toBase58(), {
+    data: feeVaultYBuf,
+    executable: false,
+    lamports: 2_039_280,
+    owner: TOKEN_2022_PROGRAM_ID,
+    rentEpoch: 0,
+  });
+
   const unpacked = await sdk.fetchPoolInfo(NATIVE_SOL_MINT, clone.mint);
   assert.equal(unpacked.tokenX.toBase58(), NATIVE_SOL_MINT.toBase58());
   assert.equal(unpacked.tokenY.toBase58(), clone.mint.toBase58());
@@ -448,6 +525,18 @@ async function main(): Promise<void> {
   assert.equal(unpacked.virtualReservesY, 0n);
   assert.equal(unpacked.totalReservesY, supplyRaw - swapOut5Sol);
   assert.equal(unpacked.lpSupply, initialLp);
+  // PoolState v2: creator + fee vault + akumulasi fee creator
+  assert.equal(unpacked.creator.toBase58(), payer.publicKey.toBase58());
+  assert.equal(
+    unpacked.feeVaultX.toBase58(),
+    createPool.addresses.feeVaultX.toBase58()
+  );
+  assert.equal(
+    unpacked.feeVaultY.toBase58(),
+    createPool.addresses.feeVaultY.toBase58()
+  );
+  assert.equal(unpacked.creatorFeeX, accruedCreatorFeeX);
+  assert.equal(unpacked.creatorFeeY, 0n);
 
   // 8. Uji batas/edge-case matematika & parser (anti-regresi)
   assert.equal(integerSqrtBigInt(0n), 0n);
@@ -463,6 +552,89 @@ async function main(): Promise<void> {
   assert.throws(() => calculateInitialLpTokens(0n, 1n));
   assert.equal(formatTokenAmount(1_500_000_000n, 9, 2), '1.5');
   assert.equal(parseTokenAmount('1,000.5', 9), 1_000_500_000_000n);
+
+  // 9. Fee creator (0.06%) + transaksi claim_creator_fee (disc 3, payload 10B)
+  //    Total 30 bps = 24 bps LP + 6 bps creator.
+  assert.equal(calculateCreatorFee(10_000n), 6n); // 6 bps
+  assert.equal(calculateCreatorFee(0n), 0n);
+  assert.equal(calculateCreatorFee(1_000_000_000n), 600_000n); // 0.06% dari 1 SOL
+  // Fee creator tidak boleh "memakan" output lebih dari 0.06%:
+  const outNoCreator = (5_000_000_000n * 9970n * supplyRaw) /
+    (DEFAULT_VIRTUAL_SOL_LAMPORTS * 10_000n + 5_000_000_000n * 9970n);
+  const totalFeeBiteBps =
+    ((outNoCreator - swapOut5Sol) * 10_000n) / outNoCreator;
+  assert.ok(
+    totalFeeBiteBps <= 1n,
+    `split fee creator mengubah output > 1 bps (${totalFeeBiteBps})`
+  );
+
+  const claim = await sdk.buildClaimCreatorFeeTx({
+    creator: payer.publicKey,
+    tokenX: NATIVE_SOL_MINT,
+    tokenY: clone.mint,
+  });
+  assert.equal(claim.serializedIxData.byteLength, 10);
+  assert.equal(CLAIM_CREATOR_FEE_IX_LAYOUT.span, 10);
+  assert.equal(claim.instruction.data[0], 3); // discriminator claim_creator_fee
+  assert.equal(claim.instruction.programId.toBase58(), DEFAULT_AMM_PROGRAM_ID.toBase58());
+  assert.equal(claim.instruction.keys.length, 10);
+  assert.equal(
+    CLAIM_CREATOR_FEE_IX_LAYOUT.decode(claim.serializedIxData).side,
+    0
+  );
+  assert.equal(CLAIM_CREATOR_FEE_IX_LAYOUT.decode(claim.serializedIxData).minAmount, 0n);
+
+  // urutan akun: creator, pool_state, token_x, token_y, fee_vault_x, fee_vault_y,
+  //              creator_token_x, creator_token_y, token_program_x, token_program_y
+  assert.equal(claim.instruction.keys[0].pubkey.toBase58(), payer.publicKey.toBase58());
+  assert.equal(claim.instruction.keys[0].isSigner, true);
+  assert.equal(
+    claim.instruction.keys[1].pubkey.toBase58(),
+    claim.addresses.poolState.toBase58()
+  );
+  assert.equal(claim.instruction.keys[2].pubkey.toBase58(), NATIVE_SOL_MINT.toBase58());
+  assert.equal(claim.instruction.keys[3].pubkey.toBase58(), clone.mint.toBase58());
+  assert.equal(
+    claim.instruction.keys[4].pubkey.toBase58(),
+    createPool.addresses.feeVaultX.toBase58()
+  );
+  assert.equal(
+    claim.instruction.keys[5].pubkey.toBase58(),
+    createPool.addresses.feeVaultY.toBase58()
+  );
+  assert.equal(
+    claim.instruction.keys[6].pubkey.toBase58(),
+    claim.creatorTokenX.toBase58()
+  );
+  assert.equal(
+    claim.instruction.keys[7].pubkey.toBase58(),
+    claim.creatorTokenY.toBase58()
+  );
+  assert.equal(claim.instruction.keys[8].pubkey.toBase58(), TOKEN_PROGRAM_ID.toBase58());
+  assert.equal(claim.instruction.keys[9].pubkey.toBase58(), TOKEN_2022_PROGRAM_ID.toBase58());
+  // 2 CreateIdempotent (ATA creator X & Y) + claim
+  assert.equal(claim.transaction.instructions.length, 3);
+  assert.equal(
+    claim.transaction.instructions[0].programId.toBase58(),
+    ASSOCIATED_TOKEN_PROGRAM_ID.toBase58()
+  );
+  assert.equal(claim.transaction.feePayer?.toBase58(), payer.publicKey.toBase58());
+  claim.transaction.sign(payer);
+  assert.ok(claim.transaction.serialize().byteLength <= 1232);
+
+  // Sisi & batas minimal ikut ter-encode dengan benar
+  const claimY = await sdk.buildClaimCreatorFeeTx({
+    creator: payer.publicKey,
+    tokenX: NATIVE_SOL_MINT,
+    tokenY: clone.mint,
+    side: 'Y',
+    minAmount: 123_456n,
+    createMissingAtas: false,
+  });
+  const decodedClaimY = CLAIM_CREATOR_FEE_IX_LAYOUT.decode(claimY.serializedIxData);
+  assert.equal(decodedClaimY.side, 2);
+  assert.equal(decodedClaimY.minAmount, 123_456n);
+  assert.equal(claimY.transaction.instructions.length, 1); // tanpa ATA idempotent
 
   console.log('ALL TOKEN-2022 & VIRTUAL LIQUIDITY AMM BINARY TESTS PASSED!');
   console.log({

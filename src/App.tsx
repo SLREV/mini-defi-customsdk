@@ -29,6 +29,7 @@ import {
   TOKEN_2022_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
   TokenStandardMode,
+  calculateCreatorFee,
   calculateSwapOutput,
   formatTokenAmount,
   parseTokenAmount,
@@ -294,6 +295,7 @@ export default function App(): React.ReactElement {
     'Siap — Luncurkan Token-2022 (MetadataPointer + On-Chain Socials) & Virtual Liquidity AMM'
   );
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [claimBusy, setClaimBusy] = useState<boolean>(false);
   const [steps, setSteps] = useState<PipelineStepLog[]>([
     {
       step: 1,
@@ -312,7 +314,7 @@ export default function App(): React.ReactElement {
     },
     {
       step: 4,
-      label: 'Fetch & Unpack 185-Byte PoolState + Token-2022 Vaults',
+      label: 'Fetch & Unpack 281-Byte PoolState + Vaults + Fee Vault',
       status: 'pending',
     },
   ]);
@@ -604,7 +606,7 @@ export default function App(): React.ReactElement {
   };
 
   /**
-   * Menulis akun biner `PoolState` (185B), `vault_x` (165B SPL), `vault_y` (165B Token-2022),
+   * Menulis akun biner `PoolState` (281B), `vault_x` (165B SPL), `vault_y` (165B Token-2022),
    * dan `lp_mint` (82B Token-2022) ke Sandbox Ledger agar `fetchPoolInfo()` menjalankan
    * jalur deserialisasi `PoolStateLayout.decode()` yang sesungguhnya.
    */
@@ -615,6 +617,12 @@ export default function App(): React.ReactElement {
     vaultX: PublicKey;
     vaultY: PublicKey;
     lpMint: PublicKey;
+    /** Fee vault creator (fee 0.06% per swap) */
+    feeVaultX: PublicKey;
+    feeVaultY: PublicKey;
+    creator: PublicKey;
+    creatorFeeX?: bigint;
+    creatorFeeY?: bigint;
     tokenProgramY: PublicKey;
     realX: bigint;
     realY: bigint;
@@ -632,6 +640,9 @@ export default function App(): React.ReactElement {
         vaultX: params.vaultX,
         vaultY: params.vaultY,
         lpMint: params.lpMint,
+        creator: params.creator,
+        feeVaultX: params.feeVaultX,
+        feeVaultY: params.feeVaultY,
         virtualReservesX: params.virtualX,
         virtualReservesY: params.virtualY,
         bump: params.bump,
@@ -696,6 +707,47 @@ export default function App(): React.ReactElement {
       rentEpoch: 0,
     });
 
+    // Fee vault creator (0.06% per swap) — ditulis agar `fetchPoolInfo()` membaca
+    // `creatorFeeX` / `creatorFeeY` lewat jalur deserialisasi yang sama.
+    const writeFeeVault = (
+      address: PublicKey,
+      mint: PublicKey,
+      programId: PublicKey,
+      amount: bigint
+    ): void => {
+      const buf = Buffer.alloc(SPL_TOKEN_ACCOUNT_SIZE);
+      SPL_TOKEN_ACCOUNT_LAYOUT.encode(
+        {
+          mint,
+          owner: params.poolAddress,
+          amount,
+          delegateOption: 0,
+          delegate: PublicKey.default,
+          state: 1,
+          isNativeOption: 0,
+          isNative: 0n,
+          delegatedAmount: 0n,
+          closeAuthorityOption: 0,
+          closeAuthority: PublicKey.default,
+        },
+        buf
+      );
+      sandboxConnection.writeRawAccount(address, {
+        data: buf,
+        executable: false,
+        lamports: 2_039_280,
+        owner: programId,
+        rentEpoch: 0,
+      });
+    };
+    writeFeeVault(params.feeVaultX, params.tokenX, TOKEN_PROGRAM_ID, params.creatorFeeX ?? 0n);
+    writeFeeVault(
+      params.feeVaultY,
+      params.tokenY,
+      params.tokenProgramY,
+      params.creatorFeeY ?? 0n
+    );
+
     const lpMintBuf = Buffer.alloc(SPL_MINT_SIZE);
     SPL_MINT_ACCOUNT_LAYOUT.encode(
       {
@@ -757,7 +809,7 @@ export default function App(): React.ReactElement {
       },
       {
         step: 4,
-        label: 'Fetch & Unpack 185-Byte PoolState + Vaults',
+        label: 'Fetch & Unpack 281-Byte PoolState + Vaults + Fee Vault',
         status: 'pending',
       },
     ]);
@@ -892,6 +944,9 @@ export default function App(): React.ReactElement {
           vaultX: createPoolResult.addresses.vaultX,
           vaultY: createPoolResult.addresses.vaultY,
           lpMint: createPoolResult.addresses.lpMint,
+          feeVaultX: createPoolResult.addresses.feeVaultX,
+          feeVaultY: createPoolResult.addresses.feeVaultY,
+          creator: activePayer,
           tokenProgramY: cloneResult.tokenProgramId,
           realX,
           realY,
@@ -955,6 +1010,10 @@ export default function App(): React.ReactElement {
             vaultX: createPoolResult.addresses.vaultX,
             vaultY: createPoolResult.addresses.vaultY,
             lpMint: createPoolResult.addresses.lpMint,
+            feeVaultX: createPoolResult.addresses.feeVaultX,
+            feeVaultY: createPoolResult.addresses.feeVaultY,
+            creator: activePayer,
+            creatorFeeX: calculateCreatorFee(firstBuySolRaw),
             tokenProgramY: cloneResult.tokenProgramId,
             realX,
             realY,
@@ -977,13 +1036,13 @@ export default function App(): React.ReactElement {
       }
 
       // ----------------------------------------------------------------------
-      // STEP 4: Fetch & Unpack 185-Byte PoolState + Vault Reserves
+      // STEP 4: Fetch & Unpack 281-Byte PoolState + Vault Reserves + Fee Vault
       // ----------------------------------------------------------------------
       setStage('FETCHING_POOL');
       setStatusBanner('Membaca & Deserialisasi PoolState + Token-2022 Vaults...');
       updateStep(4, {
         status: 'active',
-        detail: 'Unpacking 185B PoolStateLayout + 165B Vaults...',
+        detail: 'Unpacking 281B PoolStateLayout + 165B Vaults + Fee Vault...',
       });
 
       await sleep(200);
@@ -1006,7 +1065,7 @@ export default function App(): React.ReactElement {
       setPoolInfo(unpacked);
       updateStep(4, {
         status: 'done',
-        detail: `185B PoolState Terbaca | Total Efektif X: ${formatTokenAmount(unpacked.totalReservesX, 9, 2)} SOL`,
+        detail: `281B PoolState Terbaca | Total Efektif X: ${formatTokenAmount(unpacked.totalReservesX, 9, 2)} SOL`,
       });
 
       setStage('SUCCESS');
@@ -1129,6 +1188,7 @@ export default function App(): React.ReactElement {
           ? poolInfo.realReservesY - swapQuote.amountOut
           : poolInfo.realReservesY + swapQuote.amountInRaw;
 
+        const creatorFeeRaw = calculateCreatorFee(swapQuote.amountInRaw);
         commitSandboxState({
           poolAddress: poolInfo.poolAddress,
           tokenX: poolInfo.tokenX,
@@ -1136,6 +1196,14 @@ export default function App(): React.ReactElement {
           vaultX: poolInfo.vaultX,
           vaultY: poolInfo.vaultY,
           lpMint: poolInfo.lpMint,
+          feeVaultX: poolInfo.feeVaultX,
+          feeVaultY: poolInfo.feeVaultY,
+          creator: poolInfo.creator,
+          // Fee creator 0.06% diakumulasi ke fee vault sisi input.
+          creatorFeeX:
+            poolInfo.creatorFeeX + (isBuy ? creatorFeeRaw : 0n),
+          creatorFeeY:
+            poolInfo.creatorFeeY + (isBuy ? 0n : creatorFeeRaw),
           tokenProgramY: poolInfo.tokenProgramY,
           realX: nextRealX,
           realY: nextRealY,
@@ -1170,6 +1238,81 @@ export default function App(): React.ReactElement {
       setStage('ERROR');
       setErrorMessage(msg);
       setStatusBanner(`Swap gagal: ${msg}`);
+    }
+  };
+
+  /**
+   * Klaim fee creator (0.06% per swap) dari `fee_vault_x` / `fee_vault_y`.
+   * Di mode Devnet memakai transaksi `claim_creator_fee` sungguhan; di Sandbox
+   * fee vault dikosongkan pada ledger lokal agar alur UI-nya tetap teruji.
+   */
+  const handleClaimCreatorFee = async (): Promise<void> => {
+    if (!poolInfo) return;
+    const activeUser = walletPubkey ?? ephemeralKeypair.publicKey;
+    const activeConnection =
+      executionMode === 'SANDBOX' ? sandboxConnection : devnetConnection;
+    const sdk = new CustomDefiSDK(activeConnection, DEFAULT_AMM_PROGRAM_ID);
+
+    setErrorMessage(null);
+
+    if (!poolInfo.creator.equals(activeUser)) {
+      setErrorMessage(
+        `Hanya creator pool (${shortenAddress(poolInfo.creator.toBase58())}) yang bisa mengklaim fee ini. Wallet aktif: ${shortenAddress(activeUser.toBase58())}.`
+      );
+      return;
+    }
+    if (poolInfo.creatorFeeX === 0n && poolInfo.creatorFeeY === 0n) {
+      setErrorMessage(
+        'Belum ada fee creator yang terakumulasi — fee 0.06% baru terisi setelah ada swap.'
+      );
+      return;
+    }
+
+    try {
+      setClaimBusy(true);
+      setStatusBanner('Mengklaim fee creator (claim_creator_fee, disc 3)...');
+
+      if (executionMode === 'SANDBOX') {
+        commitSandboxState({
+          poolAddress: poolInfo.poolAddress,
+          tokenX: poolInfo.tokenX,
+          tokenY: poolInfo.tokenY,
+          vaultX: poolInfo.vaultX,
+          vaultY: poolInfo.vaultY,
+          lpMint: poolInfo.lpMint,
+          feeVaultX: poolInfo.feeVaultX,
+          feeVaultY: poolInfo.feeVaultY,
+          creator: poolInfo.creator,
+          creatorFeeX: 0n,
+          creatorFeeY: 0n,
+          tokenProgramY: poolInfo.tokenProgramY,
+          realX: poolInfo.realReservesX,
+          realY: poolInfo.realReservesY,
+          virtualX: poolInfo.virtualReservesX,
+          virtualY: poolInfo.virtualReservesY,
+          lpSupply: poolInfo.lpSupply,
+          bump: poolInfo.bump,
+        });
+      } else {
+        const claim = await sdk.buildClaimCreatorFeeTx({
+          creator: activeUser,
+          tokenX: poolInfo.tokenX,
+          tokenY: poolInfo.tokenY,
+        });
+        await signAndDispatch(claim.transaction, [], activeConnection);
+      }
+
+      const refreshed = await sdk.fetchPoolInfo(poolInfo.poolAddress);
+      setPoolInfo(refreshed);
+      setStatusBanner(
+        `Fee creator terklaim — sisa X: ${formatTokenAmount(refreshed.creatorFeeX, 9, 6)} SOL, Y: ${formatTokenAmount(refreshed.creatorFeeY, 9, 6)} ${ticker.toUpperCase()}`
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Klaim fee creator gagal';
+      setErrorMessage(msg);
+      setStatusBanner(`Klaim fee creator gagal: ${msg}`);
+    } finally {
+      setClaimBusy(false);
     }
   };
 
@@ -1643,7 +1786,7 @@ export default function App(): React.ReactElement {
                 <div className="mb-3 flex flex-wrap items-center justify-between gap-2 border-b border-zinc-800 pb-3">
                   <div>
                     <h3 className="text-sm font-semibold text-zinc-100">
-                      Deserialized <code className="text-emerald-400">PoolState</code> (185B) +{' '}
+                      Deserialized <code className="text-emerald-400">PoolState</code> (281B) +{' '}
                       <code className="text-cyan-300">TokenInterface</code> Vaults
                     </h3>
                     <p className="font-mono text-[11px] text-zinc-400">
@@ -1719,6 +1862,8 @@ export default function App(): React.ReactElement {
                   )}
                   {telemetry && (
                     <div className="pt-1 text-[10px] text-zinc-500">
+                      claim_creator_fee (10B):{' '}
+                      <span className="text-amber-300">[3, side, min_amount]</span> |{' '}
                       initialize_pool (17B):{' '}
                       <span className="text-cyan-300">
                         0x{telemetry.createPoolIxHex}
@@ -1734,6 +1879,55 @@ export default function App(): React.ReactElement {
                       )}
                     </div>
                   )}
+                </div>
+
+                {/* Fee Creator — 0.06% dari setiap swap (LP 0.24%) */}
+                <div className="mt-3 rounded-lg border border-amber-500/25 bg-amber-500/5 p-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="text-[11px] text-zinc-400">
+                      <span className="font-semibold text-amber-300">Fee Creator</span>{' '}
+                      0.06% per swap &bull; terakumulasi di{' '}
+                      <code className="text-zinc-300">fee_vault_x/y</code>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => void handleClaimCreatorFee()}
+                      disabled={
+                        claimBusy ||
+                        !poolInfo ||
+                        (poolInfo.creatorFeeX === 0n && poolInfo.creatorFeeY === 0n)
+                      }
+                      className="rounded-md border border-amber-500/50 bg-amber-500/15 px-2.5 py-1 text-[11px] font-medium text-amber-200 transition hover:bg-amber-500/25 disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      {claimBusy ? 'Mengklaim…' : 'Claim Fee'}
+                    </button>
+                  </div>
+                  <div className="mt-2 grid gap-1 font-mono text-[11px] text-zinc-300">
+                    <div className="flex justify-between gap-2">
+                      <span className="text-zinc-500">Siap diklaim X (SOL):</span>
+                      <span className="text-emerald-300">
+                        {formatTokenAmount(poolInfo.creatorFeeX, 9, 6)}
+                      </span>
+                    </div>
+                    <div className="flex justify-between gap-2">
+                      <span className="text-zinc-500">
+                        Siap diklaim Y ({ticker.toUpperCase()}):
+                      </span>
+                      <span className="text-emerald-300">
+                        {formatTokenAmount(poolInfo.creatorFeeY, 9, 6)}
+                      </span>
+                    </div>
+                    <div className="flex justify-between gap-2">
+                      <span className="text-zinc-500">creator:</span>
+                      <span className="truncate text-zinc-400">
+                        {shortenAddress(poolInfo.creator.toBase58(), 6)}
+                      </span>
+                    </div>
+                  </div>
+                  <p className="mt-2 text-[10px] text-zinc-500">
+                    CLI: <code className="text-zinc-400">npm run claim:creator -- --pool{' '}
+                    {shortenAddress(poolInfo.poolAddress.toBase58(), 6)}</code>
+                  </p>
                 </div>
               </div>
 
