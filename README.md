@@ -56,12 +56,87 @@ Anchor 0.31 mendukung **custom discriminator** 1 byte (`#[instruction(discrimina
 │   ├── polyfills.ts             # Buffer polyfill (Browser)
 │   ├── index.css                # Tailwind entry
 │   └── sdk/customSdk.ts         # SDK biner murni (buffer-layout, tanpa SDK pihak ketiga)
-├── tests/verifySdk.ts           # Uji layout biner, PDA, matematika AMM & deserialisasi
+├── tests/
+│   ├── verifySdk.ts             # Uji layout biner, PDA, matematika AMM & deserialisasi
+│   └── verifyPinata.ts          # Uji upload Pinata (mock server, tanpa jaringan)
+├── scripts/
+│   ├── devnetPreflight.ts       # Cek kesiapan devnet (RPC, program, saldo)
+│   └── pinataUpload.ts          # Upload gambar + metadata JSON ke IPFS (Pinata)
 ├── index.html
 ├── tailwind.config.js           # content: index.html + src/**/*.{ts,tsx}
 ├── tsconfig.json                # include: src, tests
 └── vite.config.ts
 ```
+
+## Upload Gambar & Metadata ke IPFS via Pinata
+
+Script otomatis `scripts/pinataUpload.ts` mengunggah **gambar token** lalu **JSON metadata**
+ke IPFS, dan mengembalikan dua URL gateway yang dipakai di dashboard. Implementasinya memakai
+REST API Pinata langsung (`fetch` + `FormData` bawaan Node) — **tanpa dependensi**, tanpa SDK
+deprecated, dan tidak memerlukan `dotenv`.
+
+```bash
+# 1. Siapkan kredensial (ambil dari https://app.pinata.cloud/developers/api-keys)
+cp .env.example .env
+#   isi salah satu:
+#   PINATA_JWT=...                     (disarankan)
+#   atau PINATA_API_KEY=... + PINATA_API_SECRET=...
+
+# 2. Verifikasi kredensial
+npm run pinata:check
+
+# 3. Validasi input tanpa upload (tidak perlu kredensial)
+npm run pinata:upload -- --dry-run --image ./logo.png --name "Nusantara Token" --symbol NUSA
+
+# 4. Upload sungguhan
+npm run pinata:upload -- --image ./logo.png --name "Nusantara Token" --symbol NUSA \
+    --telegram https://t.me/nusa --twitter https://x.com/nusa
+```
+
+Keluaran:
+
+```
+✓ Gambar terunggah (12.2 KB): https://gateway.pinata.cloud/ipfs/Qm...
+✓ Metadata JSON terunggah: https://gateway.pinata.cloud/ipfs/Qm...
+
+=== Hasil ===
+imageUri    : https://gateway.pinata.cloud/ipfs/QmImage...
+metadataUri : https://gateway.pinata.cloud/ipfs/QmMetadata...
+```
+
+Opsi lain: `--description`, `--website`, `--out <path>` (default `pinata-upload-result.json`,
+sudah di-.gitignore), `--help`.
+
+### Memakai hasilnya di dashboard
+
+| Kolom di dashboard | Nilai yang ditempel |
+| :--- | :--- |
+| **Image URI** | `imageUri` (URL gambar) — dipakai sebagai `image` di dalam JSON |
+| **Metadata JSON URI (opsional)** | `metadataUri` (URL JSON) — dipakai sebagai `uri` on-chain |
+
+Jika kolom *Metadata JSON URI* diisi, `uri` on-chain Token-2022 menunjuk ke JSON metadata
+(standar yang dibaca wallet/explorer), sementara `imageUri` tetap menjadi `image` di JSON.
+Jika dikosongkan, `uri` on-chain memakai Image URI apa adanya (perilaku lama).
+
+Catatan:
+
+- **Jangan** menaruh secret Pinata dengan prefix `VITE_` (`VITE_PINATA_*`) — semua `VITE_*`
+  ikut ter-bundle ke browser. Script ini hanya berjalan di Node/CLI.
+- `cidVersion: 1` dipakai agar CID kompatibel dengan gateway modern.
+- Gambar dibatasi 10 MB dan format `png/jpg/jpeg/gif/webp/svg` (validasi sebelum upload).
+- Kalau memakai *dedicated gateway*, set `PINATA_GATEWAY=https://<nama>.mypinata.cloud`.
+
+### Troubleshooting Pinata
+
+| Gejala | Solusi |
+| :--- | :--- |
+| `Pinata API error 401` | API key/JWT salah atau sudah dicabut. Buat ulang di dashboard Pinata lalu `npm run pinata:check`. |
+| `Pinata API error 403 (NO_SCOPES)` | API key tidak punya izin `pinFileToIPFS`/`pinJSONToIPFS` — aktifkan scope tersebut. |
+| Upload lambat / timeout | Gateway publik sedang padat; coba lagi atau pakai dedicated gateway. |
+| Metadata tidak tampil di wallet | Pastikan `uri` on-chain = `metadataUri` (JSON), bukan URL gambar langsung. |
+| `Kredensial Pinata belum diset` | `.env` belum dibuat/terisi, atau dijalankan dari direktori yang salah. |
+
+Uji otomatis (tanpa kredensial, memakai mock server lokal): `npm test`.
 
 ## Instal dari Nol di Linux (belum ada Node.js)
 
@@ -187,3 +262,14 @@ Tips pemakaian di dashboard:
 - Endpoint RPC bisa dioverride via `VITE_RPC_ENDPOINT` (`.env.example`), host RPC ditampilkan di header.
 - Swap jual sekarang meng-unwrap WSOL → SOL native (`CloseAccount`, opsi `unwrapWsol` di SDK).
 - `scripts/devnetPreflight.ts` (`npm run devnet:check`): cek RPC, status program executable, saldo wallet, airdrop opsional, dan artefak `target/deploy/mini_amm.so`.
+
+### Fitur Pinata (IPFS)
+
+- `scripts/pinataUpload.ts` (`npm run pinata:upload` / `pinata:check`): upload gambar + JSON
+  metadata ke IPFS memakai REST API Pinata (tanpa dependensi). Memperbaiki bug pada versi
+  awal: URL gateway (`gateway.pinata.cloud/ipfs/<hash>`, bukan `pinata.cloud{hash}`),
+  interpolasi hash, validasi env/file, serta pemetaan error HTTP.
+- `CloneTokenParams.metadataUri` (opsional): memisahkan `uri` on-chain (JSON) dari
+  `imageUri` (gambar di dalam JSON). Dashboard punya kolom **Metadata JSON URI**.
+- `tests/verifyPinata.ts`: uji parser `.env`, validasi file/argumen, bentuk metadata,
+  pipeline upload end-to-end vs mock server HTTP, dan penanganan 401.

@@ -374,6 +374,12 @@ export interface CloneTokenParams {
   name: string;
   symbol: string;
   imageUri: string;
+  /**
+   * URI JSON metadata (mis. hasil `npm run pinata:upload` -> `metadataUri`).
+   * Jika diisi, `uri` on-chain memakai nilai ini, sedangkan `imageUri` tetap
+   * dipakai sebagai `image` di dalam JSON tersebut (praktik standar Solana).
+   */
+  metadataUri?: string;
   telegram?: string;
   twitter?: string;
   decimals?: number;
@@ -1067,6 +1073,10 @@ export class CustomDefiSDK {
     const cleanName = params.name.trim();
     const cleanSymbol = params.symbol.trim().toUpperCase();
     const cleanImage = params.imageUri.trim();
+    const cleanMetadataUri = params.metadataUri?.trim();
+    // `uri` on-chain: JSON metadata bila tersedia, jika tidak jatuh ke URL gambar.
+    const onchainUri =
+      cleanMetadataUri && cleanMetadataUri.length > 0 ? cleanMetadataUri : cleanImage;
     const cleanTelegram = params.telegram?.trim();
     const cleanTwitter = params.twitter?.trim();
 
@@ -1097,7 +1107,7 @@ export class CustomDefiSDK {
       const finalMintBytes = calculateToken2022MintTotalBytes({
         name: cleanName,
         symbol: cleanSymbol,
-        uri: cleanImage,
+        uri: onchainUri,
         additionalMetadata,
       });
       const rentLamports =
@@ -1139,7 +1149,7 @@ export class CustomDefiSDK {
           mintAuthority: params.payer,
           name: cleanName,
           symbol: cleanSymbol,
-          uri: cleanImage,
+          uri: onchainUri,
         })
       );
 
@@ -1183,7 +1193,7 @@ export class CustomDefiSDK {
         tokenStandard,
         metadataAddress: mint,
         userTokenAta,
-        resolvedMetadataUri: cleanImage,
+        resolvedMetadataUri: onchainUri,
         additionalMetadata,
         offchainMetadataJson,
         allocatedMintBytes: finalMintBytes,
@@ -1219,7 +1229,7 @@ export class CustomDefiSDK {
         updateAuthority: params.payer,
         name: cleanName,
         symbol: cleanSymbol,
-        uri: cleanImage.slice(0, 200),
+        uri: onchainUri.slice(0, 200),
       })
     );
 
@@ -1250,7 +1260,7 @@ export class CustomDefiSDK {
       tokenStandard,
       metadataAddress: metadataPda,
       userTokenAta,
-      resolvedMetadataUri: cleanImage,
+      resolvedMetadataUri: onchainUri,
       additionalMetadata,
       offchainMetadataJson,
       allocatedMintBytes: SPL_MINT_SIZE,

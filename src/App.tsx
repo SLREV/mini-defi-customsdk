@@ -207,6 +207,8 @@ export default function App(): React.ReactElement {
   const [imageUri, setImageUri] = useState<string>(
     'https://ipfs.io/ipfs/bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy'
   );
+  // URI JSON metadata (mis. hasil `npm run pinata:upload`); opsional.
+  const [metadataUri, setMetadataUri] = useState<string>('');
   const [telegram, setTelegram] = useState<string>('https://t.me/nusa_2022');
   const [twitter, setTwitter] = useState<string>('https://x.com/nusa_2022');
   const [totalSupply, setTotalSupply] = useState<string>('1000000000');
@@ -662,6 +664,7 @@ export default function App(): React.ReactElement {
         name: tokenName,
         symbol: ticker,
         imageUri,
+        metadataUri: metadataUri.trim() || undefined,
         telegram,
         twitter,
         decimals: DEFAULT_TOKEN_DECIMALS,
@@ -1217,6 +1220,26 @@ export default function App(): React.ReactElement {
                   onChange={(e) => setImageUri(e.target.value)}
                   className="w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 font-mono text-xs text-zinc-200 outline-none focus:border-emerald-500"
                 />
+                <p className="mt-1 text-[11px] text-zinc-500">
+                  URL gambar (dipakai sebagai <code>image</code> di JSON metadata).
+                </p>
+              </div>
+
+              <div>
+                <label className="mb-1 block text-xs font-medium text-zinc-300">
+                  Metadata JSON URI (opsional)
+                </label>
+                <input
+                  type="url"
+                  value={metadataUri}
+                  onChange={(e) => setMetadataUri(e.target.value)}
+                  placeholder="https://gateway.pinata.cloud/ipfs/Qm... (hasil npm run pinata:upload)"
+                  className="w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 font-mono text-xs text-emerald-200 outline-none focus:border-emerald-500"
+                />
+                <p className="mt-1 text-[11px] text-zinc-500">
+                  Jika diisi, <code>uri</code> on-chain menunjuk ke JSON ini (standar
+                  wallet/explorer). Kosongkan untuk memakai Image URI langsung.
+                </p>
               </div>
 
               <div className="grid grid-cols-2 gap-3">
