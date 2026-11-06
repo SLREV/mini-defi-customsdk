@@ -61,10 +61,64 @@ export function formatVersion(v: Version | null): string {
   return v ? `${v.major}.${v.minor}.${v.patch}` : 'tidak terbaca';
 }
 
+const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+
+/**
+ * Encode byte menjadi base58 (algoritma sama dengan `bs58`):
+ * digit dihitung little-endian lalu dibalik; nol di depan menjadi '1'.
+ */
+export function encodeBase58(bytes: Uint8Array): string {
+  const digits: number[] = [0];
+  for (const byte of bytes) {
+    let carry = byte;
+    for (let i = 0; i < digits.length; i += 1) {
+      carry += digits[i] << 8;
+      digits[i] = carry % 58;
+      carry = (carry / 58) | 0;
+    }
+    while (carry > 0) {
+      digits.push(carry % 58);
+      carry = (carry / 58) | 0;
+    }
+  }
+
+  let out = '';
+  // Nol di depan → karakter '1'. Elemen terakhir tidak dihitung karena
+  // digit awal [0] sudah menghasilkan satu '1'.
+  for (let k = 0; k < bytes.length - 1 && bytes[k] === 0; k += 1) {
+    out += BASE58_ALPHABET[0];
+  }
+  for (let q = digits.length - 1; q >= 0; q -= 1) {
+    out += BASE58_ALPHABET[digits[q]];
+  }
+  return out;
+}
+
+/** Baca `declare_id!("...")` dari `programs/mini-amm/src/lib.rs`. */
+export function parseDeclareId(libRs: string): string | null {
+  const m = libRs.match(/declare_id!\s*\(\s*"(\w+)"\s*\)/);
+  return m ? m[1] : null;
+}
+
+/** Pubkey dari isi `target/deploy/<program>-keypair.json` (array 64 byte). */
+export function pubkeyFromKeypairJson(json: string): string | null {
+  try {
+    const arr = JSON.parse(json) as number[];
+    if (!Array.isArray(arr) || arr.length !== 64) {
+      return null;
+    }
+    // 32 byte terakhir = public key
+    return encodeBase58(Uint8Array.from(arr.slice(32)));
+  } catch {
+    return null;
+  }
+}
+
 export type ToolchainVerdict =
   | 'ok'
   | 'edition2024-blocked'
   | 'anchor-manifest-incompatible'
+  | 'program-id-mismatch'
   | 'missing-binary'
   | 'unknown';
 
@@ -78,6 +132,12 @@ export interface ToolchainReport {
   msrvAwareResolver: boolean;
   /** true bila Cargo.toml memakai resolver yang ditolak Anchor 0.31.1 (`3`). */
   anchorManifestIncompatible: boolean;
+  /** Pubkey program di declare_id! (programs/mini-amm/src/lib.rs). */
+  declareId: string | null;
+  /** Pubkey dari target/deploy/mini_amm-keypair.json (yang benar-benar di-deploy). */
+  deployKeypairPubkey: string | null;
+  /** true bila deploy akan memakai program ID berbeda dari declare_id!. */
+  programIdMismatch: boolean;
   binary: string | null;
   hints: string[];
 }
@@ -155,6 +215,19 @@ export function inspectToolchain(root = process.cwd()): ToolchainReport {
   const rustc = raw ? parseVersion(raw, 'rustc') : null;
   const platformTools = raw ? parsePlatformTools(raw) : null;
 
+  const libRsPath = join(root, 'programs', 'mini-amm', 'src', 'lib.rs');
+  const declareId = existsSync(libRsPath)
+    ? parseDeclareId(readFileSync(libRsPath, 'utf8'))
+    : null;
+  const keypairJsonPath = join(root, 'target', 'deploy', 'mini_amm-keypair.json');
+  const deployKeypairPubkey = existsSync(keypairJsonPath)
+    ? pubkeyFromKeypairJson(readFileSync(keypairJsonPath, 'utf8'))
+    : null;
+  const programIdMismatch =
+    declareId !== null &&
+    deployKeypairPubkey !== null &&
+    declareId !== deployKeypairPubkey;
+
   const deployDir = join(root, 'target', 'deploy');
   const binary = existsSync(join(deployDir, 'mini_amm.so'))
     ? join(deployDir, 'mini_amm.so')
@@ -196,6 +269,19 @@ export function inspectToolchain(root = process.cwd()): ToolchainReport {
     hints.push(`Toolchain SBF memakai rustc ${formatVersion(rustc)} (edition 2024 didukung).`);
   }
 
+  if (programIdMismatch) {
+    verdict = 'program-id-mismatch';
+    hints.push(
+      'PROGRAM ID TIDAK COCOK: declare_id! = ' +
+        `${declareId}, tetapi target/deploy/mini_amm-keypair.json = ${deployKeypairPubkey}.`
+    );
+    hints.push(
+      'anchor deploy memakai keypair itu, jadi program akan mendarat di alamat yang ' +
+        'BUKAN dipanggil dashboard/scripts (declare_id!). Jalankan `anchor keys sync` ' +
+        'lalu `anchor clean && anchor build` ULANG sebelum deploy.'
+    );
+  }
+
   if (anchorManifestIncompatible) {
     verdict = 'anchor-manifest-incompatible';
     hints.push(
@@ -233,6 +319,9 @@ export function inspectToolchain(root = process.cwd()): ToolchainReport {
     resolver,
     msrvAwareResolver,
     anchorManifestIncompatible,
+    declareId,
+    deployKeypairPubkey,
+    programIdMismatch,
     binary,
     hints,
   };
@@ -251,6 +340,7 @@ function main(): void {
     ok: '\u2714 OK',
     'edition2024-blocked': '\u2716 TERBLOKIR edition2024',
     'anchor-manifest-incompatible': '\u2716 MANIFEST DITOLAK ANCHOR',
+    'program-id-mismatch': '\u2716 PROGRAM ID TIDAK COCOK',
     'missing-binary': '\u26a0 cargo-build-sbf tidak ada',
     unknown: '\u26a0 versi tidak terbaca',
   };
@@ -273,6 +363,10 @@ function main(): void {
   );
   console.log(
     `Resolver MSRV   : ${report.msrvAwareResolver ? 'aktif' : `belum (resolver=${report.resolver ?? '-'})`}`
+  );
+  console.log(`declare_id!     : ${report.declareId ?? 'tidak terbaca'}`);
+  console.log(
+    `deploy keypair  : ${report.deployKeypairPubkey ?? 'belum ada (dibuat saat build pertama)'}`
   );
   console.log('');
   for (const hint of report.hints) {

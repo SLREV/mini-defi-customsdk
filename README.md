@@ -376,6 +376,7 @@ Selain itu dashboard mencetak ringkasan layout transaksi ke console (`console.ta
 | :--- | :--- |
 | `feature \`edition2024\` is required` saat `anchor build` | Cargo bawaan toolchain SBF masih 1.84. Lihat bagian **Gagal `anchor build`: feature `edition2024`** di bawah. |
 | `unknown variant \`3\`, expected \`1\` or \`2\`` | `resolver = "3"` di `Cargo.toml` — ditolak Anchor 0.31.1. Pakai `resolver = "2"` dan aktifkan MSRV-aware lewat `.cargo/config.toml`. |
+| `Attempt to load a program that does not exist` padahal deploy "sukses" | Program ter-deploy di program ID berbeda dari `declare_id!` (keypair di `target/deploy` baru dibuat). Jalankan `npm run toolchain:check`, lalu `anchor keys sync` + `anchor clean && anchor build`. |
 | `cargo-build-sbf` masih melaporkan rustc 1.84 setelah install Agave baru | Binary lama menang di `PATH`. Cek `which -a cargo-build-sbf`, pastikan `~/.local/share/solana/install/active_release/bin` ada di depan. |
 | `Downloading platform-tools v1.57 ... (506 MiB)` | Normal, sekali saja. `cargo-build-sbf` versi baru mengunduh toolchain SBF pertama kali dipakai. Jangan dihentikan. |
 | `warning: This cargo-build-sbf was installed with the Solana CLI` | Tidak berbahaya — itu `cargo-build-sbf` baru yang menyadari ada binary lain di `~/.cargo/bin`. Lihat catatan `PATH` di bagian edition2024. |
@@ -505,6 +506,49 @@ npm run toolchain:check -- --json
 Skrip ini membaca `cargo-build-sbf --version`, membandingkan rustc dengan ambang 1.85,
 memeriksa `solana_version` di `Anchor.toml` serta status resolver MSRV, dan memberi tahu
 apakah `target/deploy/mini_amm.so` sudah ada.
+
+## Sebelum `anchor deploy`: pastikan program ID cocok
+
+`anchor deploy` **tidak** memakai `declare_id!`. Ia memakai keypair di
+`target/deploy/mini_amm-keypair.json`:
+
+```rust
+None => (program.keypair_file()?.path().to_string(), program.pubkey()?),
+```
+
+Dan `keypair_file()` (Anchor 0.31.1, `cli/src/config.rs`) **membuat keypair acak baru** kalau
+file itu belum ada. Jadi kalau `target/deploy/` baru dibuat (mis. setelah `anchor clean`
+atau karena folder proyek hasil ZIP), build akan memakai program ID baru — sementara
+`declare_id!`, dashboard, dan `npm run claim:creator` tetap memanggil
+`Csre71k9LDyYGx4t2hiG6VT4wiymuhPVXeksqe6Z83Hp`. Akibatnya semua transaksi gagal dengan
+`Attempt to load a program that does not exist`.
+
+### Urutan yang benar
+
+```bash
+# 1. Cek dulu — toolchain:check membandingkan declare_id! dengan keypair deploy
+npm run toolchain:check
+#    Status : ✖ PROGRAM ID TIDAK COCOK   -> berarti keypair baru dibuat
+
+# 2. Kalau mismatch: samakan
+anchor keys sync      # declare_id! + Anchor.toml ikut keypair di target/deploy
+anchor clean && anchor build   # WAJIB build ulang, binary meng-embed program ID lama
+
+# 3. Baru deploy
+anchor deploy --provider.cluster devnet
+```
+
+> `anchor keys sync` mengubah dua tempat: `declare_id!` di `programs/mini-amm/src/lib.rs`
+> dan `[programs.devnet]` di `Anchor.toml`. Setelah itu **wajib build ulang**
+> (`anchor clean && anchor build`) — kalau tidak, `.so` masih meng-embed program ID lama dan
+> `claim:creator` / dashboard akan menembak alamat yang salah.
+
+### Kalau ingin tetap memakai `Csre71k9...`
+
+Salin keypair program yang benar ke `target/deploy/mini_amm-keypair.json` sebelum build.
+Keypair asli pemilik `Csre71k9...` hanya ada di mesin yang dulu meng-generate ID tersebut.
+Kalau tidak punya, pakai `anchor keys sync` (program pindah ke ID baru) lalu perbarui
+`DEFAULT_AMM_PROGRAM_ID` di `src/sdk/customSdk.ts` dan `[programs.*]` di `Anchor.toml`.
 
 ## Catatan Perbaikan Terakhir
 

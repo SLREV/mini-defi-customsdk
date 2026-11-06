@@ -14,7 +14,10 @@ import {
   MIN_RUSTC,
   compareVersion,
   formatVersion,
+  encodeBase58,
   inspectToolchain,
+  parseDeclareId,
+  pubkeyFromKeypairJson,
   MIN_SOLANA_VERSION,
   parsePlatformTools,
   parseSolanaVersion,
@@ -108,7 +111,60 @@ assert.ok(
 // Hanya "1"/"2" yang dikenali cargo_toml 0.19 (enum Resolver = V1 | V2).
 assert.ok(!['1', '2'].includes('3'), 'resolver 3 harus dianggap tidak kompatibel');
 
-// 7. Repo asli: konfigurasi yang dikomit memang MSRV-aware
+// 7. Program ID: declare_id! vs keypair di target/deploy
+assert.equal(
+  parseDeclareId('declare_id!("Csre71k9LDyYGx4t2hiG6VT4wiymuhPVXeksqe6Z83Hp");'),
+  'Csre71k9LDyYGx4t2hiG6VT4wiymuhPVXeksqe6Z83Hp'
+);
+assert.equal(parseDeclareId('pub fn x() {}'), null);
+
+// Base58: 32 byte nol = System Program (32 karakter '1')
+assert.equal(encodeBase58(new Uint8Array(32)), '1'.repeat(32));
+// Vektor uji resmi crate `bs58` (dipakai @solana/web3.js)
+assert.equal(encodeBase58(Uint8Array.from([0])), '1');
+assert.equal(encodeBase58(Uint8Array.from([0, 0])), '11');
+// Vektor di bawah diverifikasi langsung terhadap `bs58` (dependency web3.js)
+assert.equal(encodeBase58(Uint8Array.from([57, 2, 0])), 'L9bu');
+assert.equal(encodeBase58(Uint8Array.from([255])), '5Q');
+assert.equal(encodeBase58(Uint8Array.from([1, 2, 3])), 'Ldp');
+
+// Isi keypair Solana = 64 byte: seed(32) + publicKey(32). Hanya 32 byte
+// terakhir yang dipakai untuk menghitung pubkey.
+const seq = Uint8Array.from({ length: 32 }, (_, i) => i + 1);
+const seqB58 = encodeBase58(seq);
+const keypairBytes = Uint8Array.from([...new Uint8Array(32).fill(9), ...seq]);
+assert.equal(pubkeyFromKeypairJson(JSON.stringify(Array.from(keypairBytes))), seqB58);
+assert.equal(
+  pubkeyFromKeypairJson(JSON.stringify(Array.from(new Uint8Array(64)))),
+  '1'.repeat(32),
+  'keypair nol = System Program'
+);
+assert.equal(pubkeyFromKeypairJson('[]'), null);
+assert.equal(pubkeyFromKeypairJson('bukan json'), null);
+assert.equal(pubkeyFromKeypairJson(JSON.stringify([1, 2, 3])), null, 'harus 64 byte');
+
+// Mismatch: keypair berbeda dari declare_id! harus terdeteksi
+const mismatchRoot = mkdtempSync(join(tmpdir(), 'doctor-mismatch-'));
+mkdirSync(join(mismatchRoot, 'programs', 'mini-amm', 'src'), { recursive: true });
+writeFileSync(
+  join(mismatchRoot, 'programs', 'mini-amm', 'src', 'lib.rs'),
+  'declare_id!("Csre71k9LDyYGx4t2hiG6VT4wiymuhPVXeksqe6Z83Hp");\n'
+);
+writeFileSync(join(mismatchRoot, 'Cargo.toml'), '[workspace]\nresolver = "2"\n');
+mkdirSync(join(mismatchRoot, 'target', 'deploy'), { recursive: true });
+// keypair dengan public key 1..32 -> beda dari declare_id!
+writeFileSync(
+  join(mismatchRoot, 'target', 'deploy', 'mini_amm-keypair.json'),
+  JSON.stringify(Array.from(keypairBytes))
+);
+const mm = inspectToolchain(mismatchRoot);
+assert.equal(mm.declareId, 'Csre71k9LDyYGx4t2hiG6VT4wiymuhPVXeksqe6Z83Hp');
+assert.equal(mm.deployKeypairPubkey, seqB58);
+assert.equal(mm.programIdMismatch, true);
+assert.equal(mm.verdict, 'program-id-mismatch');
+assert.ok(mm.hints.some((h) => h.includes('PROGRAM ID TIDAK COCOK')));
+
+// 8. Repo asli: konfigurasi yang dikomit memang MSRV-aware
 const repoRoot = fileURLToPath(new URL('..', import.meta.url));
 const repo = inspectToolchain(repoRoot);
 assert.equal(repo.resolver, '2', 'Cargo.toml root wajib resolver = "2" (Anchor 0.31.1 menolak "3")');
