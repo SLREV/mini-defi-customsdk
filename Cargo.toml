@@ -1,6 +1,17 @@
 [workspace]
 members = ["programs/*"]
-resolver = "2"
+# Resolver 3 = "MSRV-aware resolver" (stabil di Cargo 1.84). Cargo memilih versi
+# dependency terbaru yang `rust-version`-nya masih cocok dengan workspace, bukan
+# sekadar versi terbaru. Ini yang mencegah `zeroize_derive 1.5`, `blake3 1.8.3`,
+# `constant_time_eq 0.4.2`, dst. (semuanya edition 2024) ikut ter-resolve saat
+# build SBF memakai Cargo 1.84 bawaan platform-tools.
+resolver = "3"
+
+[workspace.package]
+# Versi rustc/Cargo yang dibawa platform-tools (yang dipakai `cargo-build-sbf`
+# lewat `anchor build`). Dinaikkan hanya setelah toolchain SBF-nya ikut naik
+# (lihat README "Gagal `anchor build`: feature `edition2024`").
+rust-version = "1.84"
 
 [profile.release]
 overflow-checks = true

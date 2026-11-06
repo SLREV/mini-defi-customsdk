@@ -297,8 +297,9 @@ npm run build    # Type-check + build produksi Vite (dist/)
 npm run dev      # Dashboard interaktif di http://localhost:5173 (0.0.0.0)
 
 npm run claim:creator -- --pool <POOL_PDA>   # Cek fee creator yang bisa diklaim (dry-run)
+npm run toolchain:check  # Cek toolchain SBF (rustc/Cargo untuk `anchor build`)
 
-anchor build     # Build smart contract Rust (butuh Solana + Anchor CLI 0.31.1)
+anchor build     # Build smart contract Rust (butuh Anchor CLI 0.31.1 + Agave >= 4.0)
 anchor deploy    # Deploy program mini_amm ke devnet
 ```
 
@@ -314,7 +315,10 @@ Mode **Devnet RPC** hanya bisa dipakai setelah 3 hal ini terpenuhi:
 
 ```bash
 # 0. Toolchain
-#    Solana CLI + Anchor CLI 0.31.1 (avm install 0.31.1 && avm use 0.31.1)
+#    Anchor CLI 0.31.1 (avm install 0.31.1 && avm use 0.31.1)
+#    Agave/Solana CLI >= 4.0 (WAJIB, lihat catatan edition2024 di bawah)
+sh -c "$(curl -sSfL https://release.anza.xyz/v4.4.1/install)"
+npm run toolchain:check          # pastikan rustc SBF >= 1.85
 
 # 1. Wallet provider
 solana-keygen new -o ~/.config/solana/id.json   # jika belum punya
@@ -324,7 +328,8 @@ solana config set --url devnet
 anchor keys sync
 
 # 3. Build & deploy program ke devnet
-anchor build
+anchor build                     # menghasilkan target/deploy/mini_amm.so
+ls -la target/deploy/mini_amm.so # harus ada SEBELUM deploy
 anchor deploy --provider.cluster devnet
 
 # 4. Verifikasi kesiapan devnet (RPC, program executable, saldo wallet)
@@ -369,12 +374,97 @@ Selain itu dashboard mencetak ringkasan layout transaksi ke console (`console.ta
 
 | Gejala | Penyebab & solusi |
 | :--- | :--- |
+| `feature \`edition2024\` is required` saat `anchor build` | Cargo bawaan toolchain SBF masih 1.84. Lihat bagian **Gagal `anchor build`: feature `edition2024`** di bawah. |
+| `info: uninstalling toolchain solana` lalu `toolchain solana uninstalled` | Normal — itu `cargo-build-sbf` yang me-*relink* toolchain rustup `solana` ke platform-tools bawaannya setiap build. Solana CLI Anda tidak dihapus. |
+| `anchor deploy` → `Unable to open program file: target/deploy/mini_amm.so` | Build-nya belum pernah sukses, jadi `.so` tidak ada. Deploy **tidak** membangun apa pun. Perbaiki `anchor build` dulu, baru deploy. |
 | `Attempt to load a program that does not exist` | Program belum ter-deploy di devnet / program ID tidak sama dengan `declare_id!`. Jalankan `anchor keys sync` lalu `anchor deploy --provider.cluster devnet`. |
 | `Saldo SOL wallet tidak cukup…` | Klik **Airdrop 1 SOL** (mock keypair) atau hubungkan Phantom berisi SOL devnet, atau faucet.solana.com. |
 | `RPC … menolak karena rate-limit (429)` | Isi `VITE_RPC_ENDPOINT` di file `.env` (salin dari `.env.example`) dengan RPC devnet lain (Helius/QuickNode). |
 | `Airdrop gagal` | Rate limit faucet RPC publik — pakai faucet.solana.com atau RPC berbayar. |
 | `Blockhash kedaluwarsa` | Kirim ulang; pipeline selalu mengambil blockhash baru sebelum tanda tangan. |
 | Transaksi sukses tapi saldo token 0 | Cek `Telemetry → initialize_pool (17B)` dan pastikan program yang dipanggil adalah versi terbaru (`anchor upgrade` bila perlu). |
+
+## Gagal `anchor build`: feature `edition2024`
+
+Gejalanya seperti ini (berhenti **sebelum** kompilasi, saat mengunduh dependency):
+
+```
+Downloaded zeroize_derive v1.5.0
+error: failed to parse manifest at `.../zeroize_derive-1.5.0/Cargo.toml`
+Caused by:
+  feature `edition2024` is required
+  ... but that feature is not stabilized in this version of Cargo (1.84.0 ...)
+```
+
+Dan `anchor deploy` kemudian gagal dengan `Unable to open program file: ...mini_amm.so`.
+Itu **bukan dua bug**: `anchor deploy` tidak pernah membangun apa pun — ia hanya meng-upload
+`target/deploy/mini_amm.so` yang seharusnya dihasilkan `anchor build`. Build gagal ⇒ file tidak
+ada ⇒ deploy gagal. Perbaiki build-nya, deploy ikut beres.
+
+### Kenapa terjadi
+
+`anchor build` memanggil `cargo-build-sbf`, dan **binary itu membawa Cargo/rustc sendiri**
+(platform-tools), bukan rustc sistem Anda. Edisi 2024 baru dikenali mulai Cargo 1.85, sedangkan
+platform-tools lama masih membawa Cargo 1.84:
+
+| Agave / Solana CLI | platform-tools | rustc | edition 2024 |
+| :--- | :--- | :--- | :--- |
+| 2.2.x | v1.48 | 1.84.1 | ❌ |
+| 3.0.x | v1.51 | 1.84.1 | ❌ |
+| 4.0.x | v1.53 | 1.89.0 | ✅ |
+| 4.4.x | v1.57 | 1.95.0 | ✅ |
+
+Masalah muncul belakangan tanpa Anda mengubah kode: crate transitif seperti
+`zeroize_derive 1.5`, `blake3 1.8.3`, dan `constant_time_eq 0.4.2` menaikkan edisinya ke 2024.
+
+### Perbaikan (urutan yang disarankan)
+
+**1. Upgrade toolchain SBF — ini akar masalahnya.**
+
+   Toolchain yang sudah terbukti aman: **Anchor CLI 0.31.1 + Agave 4.4.1** (platform-tools
+   v1.57, rustc 1.95) atau **Agave 4.0.x** (platform-tools v1.53, rustc 1.89). Anchor 0.31.1
+   hanya butuh Cargo >= 1.80 untuk membaca manifest program, jadi kombinasi ini tidak konflik.
+
+```bash
+sh -c "$(curl -sSfL https://release.anza.xyz/v4.4.1/install)"   # Agave 4.4.1
+anchor clean                                                     # buang cache build lama
+cargo-build-sbf --version                                        # harus rustc >= 1.85
+npm run toolchain:check                                          # status + saran otomatis
+anchor build
+```
+
+`Anchor.toml` sudah mematok `solana_version = "4.4.1"` di `[toolchain]`, sehingga
+`anchor build`/`anchor deploy` otomatis berpindah ke rilis itu lewat `agave-install`
+lalu mengembalikan versi aktif setelah selesai.
+
+**2. Cadangan bila toolchain belum bisa di-upgrade: paksa versi crate lama.**
+
+Repo ini sudah menyiapkan dua lapis: `resolver = "3"` di `Cargo.toml` (resolver MSRV-aware)
+dan `.cargo/config.toml` berisi `incompatible-rust-versions = "fallback"`. Cargo lalu memilih
+versi dependency terbaru yang masih cocok, bukan yang terbaru mutlak.
+
+Kalau masih ada crate yang **semua** versinya edition 2024 (mis. `blake3 1.8.3` yang tidak
+mendeklarasikan `rust-version`), patok manual:
+
+```bash
+# jalankan dari root repo, lalu ulangi `anchor build`
+cargo update -p blake3 --precise 1.8.2
+cargo update -p zeroize_derive --precise 1.4.3
+```
+
+**3. Jangan pakai nightly rustc.** `cargo-build-sbf` selalu memakai toolchain bawaannya;
+mengganti rustc sistem (`rustup default nightly`) tidak berpengaruh sama sekali.
+
+### Cek cepat
+
+```bash
+npm run toolchain:check     # ringkasan + langkah perbaikan
+npm run toolchain:check -- --json
+```
+
+Skrip ini membaca `cargo-build-sbf --version`, membandingkan rustc dengan ambang 1.85,
+memeriksa `solana_version` di `Anchor.toml` serta status resolver MSRV, dan memberi tahu
+apakah `target/deploy/mini_amm.so` sudah ada.
 
 ## Catatan Perbaikan Terakhir
 
