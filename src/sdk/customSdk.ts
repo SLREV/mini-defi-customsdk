@@ -528,7 +528,14 @@ export function parseTokenAmount(
   decimals = DEFAULT_TOKEN_DECIMALS
 ): bigint {
   if (typeof amount === 'bigint') {
-    return amount * 10n ** BigInt(decimals);
+    if (amount < 0n) {
+      throw new RangeError(`Nilai token tidak boleh negatif: ${amount.toString()}`);
+    }
+    const raw = amount * 10n ** BigInt(decimals);
+    if (raw > MAX_U64) {
+      throw new RangeError(`Nilai raw (${raw.toString()}) melebihi batas u64 Solana`);
+    }
+    return raw;
   }
   const normalized = String(amount).trim().replace(/,/g, '');
   if (!/^\d+(\.\d+)?$/.test(normalized)) {
@@ -616,6 +623,13 @@ export function calculateSwapOutput(
   const numerator = amountInWithFee * reserveOut;
   const denominator = reserveIn * 1000n + amountInWithFee;
   const out = numerator / denominator;
+  // Paritas 1:1 dengan `calculate_swap_output` di `programs/mini-amm/src/lib.rs`
+  if (out <= 0n) {
+    throw new Error('Computed swap output amount is zero');
+  }
+  if (out >= reserveOut) {
+    throw new Error('Computed swap output exhausts the output reserve');
+  }
   if (out > MAX_U64) {
     throw new RangeError('Swap output exceeds u64 bounds');
   }
@@ -1219,6 +1233,13 @@ export class CustomDefiSDK {
   /**
    * Serialisasi `initialize_pool` (`u8` discriminator = 0 + `initialRealTokenY` + `virtualReservesX`)
    * dan menyusun 15 `AccountMeta` lintas-program (`tokenProgramX`, `tokenProgramY`, `tokenProgramLp`).
+   *
+   * Transaksi yang dihasilkan berisi 2 instruksi:
+   * 1. `CreateIdempotent` ATA `userTokenY` — account ini WAJIB sudah ada karena
+   *    `InitializePool<'info>` mendeklarasikannya sebagai `token::authority = payer`
+   *    (bukan `init_if_needed`), sehingga tanpa instruksi ini `initialize_pool` gagal
+   *    dengan `AccountNotInitialized` bila pengguna belum punya ATA token Y.
+   * 2. `initialize_pool` (17 byte payload, disc = 0).
    */
   public async buildCreatePoolTx(
     params: CreatePoolParams
@@ -1289,12 +1310,24 @@ export class CustomDefiSDK {
       data: serializedIxData,
     });
 
-    const transaction = new Transaction().add(instruction);
+    const transaction = new Transaction().add(
+      // ATA token Y milik pembuat pool harus ada sebelum CPI `transfer_checked`.
+      this.buildCreateAssociatedTokenIdempotentInstruction(
+        params.payer,
+        userTokenY,
+        params.payer,
+        tokenY,
+        tokenProgramY
+      ),
+      instruction
+    );
     transaction.feePayer = params.payer;
     transaction.recentBlockhash =
       params.recentBlockhash ??
       (await this.connection.getLatestBlockhash('confirmed')).blockhash;
 
+    // Kurva efektif = `vault.amount + virtual_reserves`; karena `virtual_reserves_y = 0`
+    // (lihat `initialize_pool`), suplai LP awal = sqrt(virtualReservesX * initialRealTokenY).
     const expectedInitialLp = calculateInitialLpTokens(
       virtualReservesX,
       initialRealTokenY

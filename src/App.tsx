@@ -538,7 +538,9 @@ export default function App(): React.ReactElement {
           realX,
           realY,
           virtualX: virtualSolRaw,
-          virtualY: supplyRaw,
+          // `initialize_pool` menyimpan virtual_reserves_y = 0: seluruh suplai token
+          // fisik sudah berada di `vault_y`, jadi token Y tidak boleh dihitung dua kali.
+          virtualY: 0n,
           lpSupply: createPoolResult.expectedInitialLp,
           bump: createPoolResult.addresses.poolBump,
         });
@@ -560,8 +562,9 @@ export default function App(): React.ReactElement {
           detail: `Membeli dengan ${formatTokenAmount(firstBuySolRaw)} SOL...`,
         });
 
+        // Cadangan efektif = vault.amount + virtual_reserves (virtual_reserves_y = 0).
         const totalX = realX + virtualSolRaw;
-        const totalY = realY + supplyRaw;
+        const totalY = realY;
         const expectedOut = calculateSwapOutput(firstBuySolRaw, totalX, totalY);
 
         const swapBuild = await sdk.buildSwapTx({
@@ -594,7 +597,7 @@ export default function App(): React.ReactElement {
             realX,
             realY,
             virtualX: virtualSolRaw,
-            virtualY: supplyRaw,
+            virtualY: 0n,
             lpSupply: createPoolResult.expectedInitialLp,
             bump: createPoolResult.addresses.poolBump,
           });
@@ -786,8 +789,9 @@ export default function App(): React.ReactElement {
       );
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Swap gagal';
-      setStage('SUCCESS');
+      setStage('ERROR');
       setErrorMessage(msg);
+      setStatusBanner(`Swap gagal: ${msg}`);
     }
   };
 
@@ -1023,7 +1027,6 @@ export default function App(): React.ReactElement {
                   </label>
                   <input
                     type="text"
-                    required
                     value={initialBuySol}
                     onChange={(e) => setInitialBuySol(e.target.value)}
                     className="w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 font-mono text-sm text-emerald-300 outline-none focus:border-emerald-500"
