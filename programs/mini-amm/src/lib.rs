@@ -12,10 +12,18 @@ pub const AMM_POOL_SEED: &[u8] = b"amm_pool";
 pub const LP_MINT_SEED: &[u8] = b"lp_mint";
 pub const VAULT_X_SEED: &[u8] = b"vault_x";
 pub const VAULT_Y_SEED: &[u8] = b"vault_y";
+pub const FEE_VAULT_X_SEED: &[u8] = b"fee_vault_x";
+pub const FEE_VAULT_Y_SEED: &[u8] = b"fee_vault_y";
 
-/// 0.30% LP swap fee (30 bps => 997 / 1000 retained on input)
-pub const FEE_NUMERATOR: u128 = 3;
-pub const FEE_DENOMINATOR: u128 = 1_000;
+/// Total fee swap = 30 bps (0.30%) dari `amount_in`, dipecah menjadi:
+///   - 24 bps (0.24%) -> LP (tertinggal di vault_x / vault_y, memperbesar `k`)
+///   -  6 bps (0.06%) -> creator pool (masuk `fee_vault_x` / `fee_vault_y`, diklaim manual)
+///
+/// Fee creator = 20% dari total fee 0.30%.
+pub const BPS_DENOMINATOR: u128 = 10_000;
+pub const TOTAL_FEE_BPS: u128 = 30;
+pub const CREATOR_FEE_BPS: u128 = 6;
+pub const LP_FEE_BPS: u128 = TOTAL_FEE_BPS - CREATOR_FEE_BPS; // 24
 
 #[program]
 pub mod mini_amm {
@@ -49,6 +57,9 @@ pub mod mini_amm {
         pool.vault_x = ctx.accounts.vault_x.key();
         pool.vault_y = ctx.accounts.vault_y.key();
         pool.lp_mint = ctx.accounts.lp_mint.key();
+        pool.creator = ctx.accounts.payer.key();
+        pool.fee_vault_x = ctx.accounts.fee_vault_x.key();
+        pool.fee_vault_y = ctx.accounts.fee_vault_y.key();
 
         // Set konfigurasi Virtual Curve di detik ke-0.
         //
@@ -239,6 +250,14 @@ pub mod mini_amm {
         let amount_out = calculate_swap_output(amount_in, reserve_in, reserve_out)?;
         require!(amount_out >= min_amount_out, AmmError::SlippageExceeded);
 
+        // Fee creator (0.06%) dipotong dari `amount_in` SEBELUM masuk vault AMM,
+        // sehingga cadangan vault (dan invariant k) tetap bersih dari fee creator.
+        let creator_fee = calculate_creator_fee(amount_in)?;
+        let net_in = amount_in
+            .checked_sub(creator_fee)
+            .ok_or(AmmError::MathOverflow)?;
+        require!(net_in > 0, AmmError::ZeroSwapAmount);
+
         // Pastikan saldo fisik riil di vault tujuan mencukupi untuk ditransfer keluar
         if x_to_y {
             require!(
@@ -263,7 +282,23 @@ pub mod mini_amm {
         ]];
 
         if x_to_y {
-            // Token X (SOL/WSOL) -> Vault X
+            // Token X (SOL/WSOL) -> Fee Vault X (bagian creator)
+            if creator_fee > 0 {
+                token_interface::transfer_checked(
+                    CpiContext::new(
+                        ctx.accounts.token_program_x.to_account_info(),
+                        TransferChecked {
+                            from: ctx.accounts.user_token_x.to_account_info(),
+                            to: ctx.accounts.fee_vault_x.to_account_info(),
+                            authority: ctx.accounts.user.to_account_info(),
+                            mint: ctx.accounts.token_x.to_account_info(),
+                        },
+                    ),
+                    creator_fee,
+                    ctx.accounts.token_x.decimals,
+                )?;
+            }
+            // Token X (SOL/WSOL) -> Vault X (bagian LP)
             token_interface::transfer_checked(
                 CpiContext::new(
                     ctx.accounts.token_program_x.to_account_info(),
@@ -274,7 +309,7 @@ pub mod mini_amm {
                         mint: ctx.accounts.token_x.to_account_info(),
                     },
                 ),
-                amount_in,
+                net_in,
                 ctx.accounts.token_x.decimals,
             )?;
             // Vault Y -> Token Y (Token-2022 ke User)
@@ -293,7 +328,23 @@ pub mod mini_amm {
                 ctx.accounts.token_y.decimals,
             )?;
         } else {
-            // Token Y (Token-2022) -> Vault Y
+            // Token Y (Token-2022) -> Fee Vault Y (bagian creator)
+            if creator_fee > 0 {
+                token_interface::transfer_checked(
+                    CpiContext::new(
+                        ctx.accounts.token_program_y.to_account_info(),
+                        TransferChecked {
+                            from: ctx.accounts.user_token_y.to_account_info(),
+                            to: ctx.accounts.fee_vault_y.to_account_info(),
+                            authority: ctx.accounts.user.to_account_info(),
+                            mint: ctx.accounts.token_y.to_account_info(),
+                        },
+                    ),
+                    creator_fee,
+                    ctx.accounts.token_y.decimals,
+                )?;
+            }
+            // Token Y (Token-2022) -> Vault Y (bagian LP)
             token_interface::transfer_checked(
                 CpiContext::new(
                     ctx.accounts.token_program_y.to_account_info(),
@@ -304,7 +355,7 @@ pub mod mini_amm {
                         mint: ctx.accounts.token_y.to_account_info(),
                     },
                 ),
-                amount_in,
+                net_in,
                 ctx.accounts.token_y.decimals,
             )?;
             // Vault X -> Token X (SOL/WSOL ke User)
@@ -326,6 +377,107 @@ pub mod mini_amm {
 
         Ok(())
     }
+
+    /// Discriminator [3]: Klaim fee creator yang terakumulasi di `fee_vault_x` / `fee_vault_y`.
+    ///
+    /// Payload 10B: `[u8(3), u8(side), u64_le(min_amount)]`
+    /// `side`: `0` = kedua sisi sekaligus, `1` = token X saja, `2` = token Y saja.
+    /// `min_amount` = batas minimal per sisi yang diklaim (proteksi terhadap akumulasi
+    /// yang belum layak diklaim / fee vault tiba-tiba kosong).
+    #[instruction(discriminator = [3])]
+    pub fn claim_creator_fee(
+        ctx: Context<ClaimCreatorFee>,
+        side: u8,
+        min_amount: u64,
+    ) -> Result<()> {
+        require!(side <= 2, AmmError::InvalidClaimSide);
+
+        let claim_x = side == 0 || side == 1;
+        let claim_y = side == 0 || side == 2;
+
+        let amount_x = if claim_x {
+            ctx.accounts.fee_vault_x.amount
+        } else {
+            0
+        };
+        let amount_y = if claim_y {
+            ctx.accounts.fee_vault_y.amount
+        } else {
+            0
+        };
+
+        require!(amount_x > 0 || amount_y > 0, AmmError::NothingToClaim);
+        if claim_x {
+            require!(amount_x >= min_amount, AmmError::ClaimBelowMinimum);
+        }
+        if claim_y {
+            require!(amount_y >= min_amount, AmmError::ClaimBelowMinimum);
+        }
+
+        let token_x_key = ctx.accounts.pool_state.token_x;
+        let token_y_key = ctx.accounts.pool_state.token_y;
+        let bump = ctx.accounts.pool_state.bump;
+        let signer_seeds: &[&[&[u8]]] = &[&[
+            AMM_POOL_SEED,
+            token_x_key.as_ref(),
+            token_y_key.as_ref(),
+            &[bump],
+        ]];
+
+        if amount_x > 0 {
+            token_interface::transfer_checked(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program_x.to_account_info(),
+                    TransferChecked {
+                        from: ctx.accounts.fee_vault_x.to_account_info(),
+                        to: ctx.accounts.creator_token_x.to_account_info(),
+                        authority: ctx.accounts.pool_state.to_account_info(),
+                        mint: ctx.accounts.token_x.to_account_info(),
+                    },
+                    signer_seeds,
+                ),
+                amount_x,
+                ctx.accounts.token_x.decimals,
+            )?;
+        }
+
+        if amount_y > 0 {
+            token_interface::transfer_checked(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program_y.to_account_info(),
+                    TransferChecked {
+                        from: ctx.accounts.fee_vault_y.to_account_info(),
+                        to: ctx.accounts.creator_token_y.to_account_info(),
+                        authority: ctx.accounts.pool_state.to_account_info(),
+                        mint: ctx.accounts.token_y.to_account_info(),
+                    },
+                    signer_seeds,
+                ),
+                amount_y,
+                ctx.accounts.token_y.decimals,
+            )?;
+        }
+
+        emit!(CreatorFeeClaimed {
+            pool: ctx.accounts.pool_state.key(),
+            creator: ctx.accounts.creator.key(),
+            side,
+            amount_x,
+            amount_y,
+        });
+
+        Ok(())
+    }
+}
+
+/// Event `claim_creator_fee` (tercatat di transaksi, mudah dibaca indexer/script).
+#[event]
+pub struct CreatorFeeClaimed {
+    pub pool: Pubkey,
+    pub creator: Pubkey,
+    pub side: u8,
+    pub amount_x: u64,
+    pub amount_y: u64,
 }
 
 // --- LOGIKA MATEMATIKA AMM (STABIL & BEBAS OVERFLOW U128/U256) ---
@@ -340,18 +492,33 @@ pub fn calculate_initial_lp_tokens(amount_x: u64, amount_y: u64) -> Result<u64> 
     u64::try_from(lp).map_err(|_| AmmError::MathOverflow.into())
 }
 
+/// Fee creator = 0.06% dari `amount_in` (6 bps), dipotong dari input sebelum masuk vault.
+pub fn calculate_creator_fee(amount_in: u64) -> Result<u64> {
+    let fee = mul_div_u128(u128::from(amount_in), CREATOR_FEE_BPS, BPS_DENOMINATOR)
+        .ok_or(AmmError::MathOverflow)?;
+    u64::try_from(fee).map_err(|_| AmmError::MathOverflow.into())
+}
+
+/// Output swap: fee creator dipotong lebih dulu, lalu sisa input dikenai fee LP 24 bps
+/// (konstanta produk). Total beban swap tetap ~0.30%: 0.06% creator + 0.24% LP.
 pub fn calculate_swap_output(amount_in: u64, reserve_in: u64, reserve_out: u64) -> Result<u64> {
     require!(amount_in > 0, AmmError::ZeroSwapAmount);
     require!(reserve_in > 0 && reserve_out > 0, AmmError::EmptyReserves);
 
-    let fee_retained = FEE_DENOMINATOR
-        .checked_sub(FEE_NUMERATOR)
+    let creator_fee = calculate_creator_fee(amount_in)?;
+    let net_in = amount_in
+        .checked_sub(creator_fee)
         .ok_or(AmmError::MathOverflow)?;
-    let amount_in_with_fee = u128::from(amount_in)
+    require!(net_in > 0, AmmError::ZeroSwapAmount);
+
+    let fee_retained = BPS_DENOMINATOR
+        .checked_sub(LP_FEE_BPS)
+        .ok_or(AmmError::MathOverflow)?;
+    let amount_in_with_fee = u128::from(net_in)
         .checked_mul(fee_retained)
         .ok_or(AmmError::MathOverflow)?;
     let denominator = u128::from(reserve_in)
-        .checked_mul(FEE_DENOMINATOR)
+        .checked_mul(BPS_DENOMINATOR)
         .and_then(|v| v.checked_add(amount_in_with_fee))
         .ok_or(AmmError::MathOverflow)?;
 
@@ -421,18 +588,21 @@ pub fn mul_div_u128(a: u128, b: u128, denominator: u128) -> Option<u128> {
     Some(quot)
 }
 
-/// Akun PoolState Token-2022 Virtual Liquidity AMM (8B discriminator + 177B = 185 bytes)
+/// Akun PoolState Token-2022 Virtual Liquidity AMM (8B discriminator + 273B = 281 bytes)
 #[account]
 #[derive(InitSpace)]
 pub struct PoolState {
-    pub token_x: Pubkey,          // 32B (8..40)   Mint Token X (misal: WSOL)
-    pub token_y: Pubkey,          // 32B (40..72)  Mint Token Y (Token-2022 Proyek)
-    pub vault_x: Pubkey,          // 32B (72..104) Vault penampung Token X riil
-    pub vault_y: Pubkey,          // 32B (104..136) Vault penampung Token Y riil
-    pub lp_mint: Pubkey,          // 32B (136..168) Mint LP Token
-    pub virtual_reserves_x: u64,  // 8B  (168..176) Likuiditas bayangan X (misal: 30 SOL)
-    pub virtual_reserves_y: u64,  // 8B  (176..184) Likuiditas bayangan Y (0 pada inisialisasi)
-    pub bump: u8,                 // 1B  (184..185) Canonical PDA bump
+    pub token_x: Pubkey,          // 32B (8..40)     Mint Token X (misal: WSOL)
+    pub token_y: Pubkey,          // 32B (40..72)    Mint Token Y (Token-2022 Proyek)
+    pub vault_x: Pubkey,          // 32B (72..104)   Vault penampung Token X riil
+    pub vault_y: Pubkey,          // 32B (104..136)  Vault penampung Token Y riil
+    pub lp_mint: Pubkey,          // 32B (136..168)  Mint LP Token
+    pub creator: Pubkey,          // 32B (168..200)  Wallet pembuat pool (penerima fee creator)
+    pub fee_vault_x: Pubkey,      // 32B (200..232)  Penampung fee creator dalam Token X
+    pub fee_vault_y: Pubkey,      // 32B (232..264)  Penampung fee creator dalam Token Y
+    pub virtual_reserves_x: u64,  // 8B  (264..272)  Likuiditas bayangan X (misal: 30 SOL)
+    pub virtual_reserves_y: u64,  // 8B  (272..280)  Likuiditas bayangan Y (0 pada inisialisasi)
+    pub bump: u8,                 // 1B  (280..281)  Canonical PDA bump
 }
 
 #[derive(Accounts)]
@@ -490,6 +660,30 @@ pub struct InitializePool<'info> {
         token::token_program = token_program_y,
     )]
     pub vault_y: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    /// Penampung fee creator sisi Token X (0.06% tiap swap X -> Y).
+    #[account(
+        init,
+        payer = payer,
+        seeds = [FEE_VAULT_X_SEED, pool_state.key().as_ref()],
+        bump,
+        token::mint = token_x,
+        token::authority = pool_state,
+        token::token_program = token_program_x,
+    )]
+    pub fee_vault_x: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    /// Penampung fee creator sisi Token Y (0.06% tiap swap Y -> X).
+    #[account(
+        init,
+        payer = payer,
+        seeds = [FEE_VAULT_Y_SEED, pool_state.key().as_ref()],
+        bump,
+        token::mint = token_y,
+        token::authority = pool_state,
+        token::token_program = token_program_y,
+    )]
+    pub fee_vault_y: Box<InterfaceAccount<'info, TokenAccount>>,
 
     #[account(
         mut,
@@ -617,6 +811,8 @@ pub struct Swap<'info> {
         bump = pool_state.bump,
         has_one = vault_x @ AmmError::InvalidVault,
         has_one = vault_y @ AmmError::InvalidVault,
+        has_one = fee_vault_x @ AmmError::InvalidFeeVault,
+        has_one = fee_vault_y @ AmmError::InvalidFeeVault,
     )]
     pub pool_state: Box<Account<'info, PoolState>>,
 
@@ -638,6 +834,24 @@ pub struct Swap<'info> {
     )]
     pub vault_y: Box<InterfaceAccount<'info, TokenAccount>>,
 
+    /// Penampung fee creator sisi Token X — wajib ikut agar akumulasi 0.06% konsisten.
+    #[account(
+        mut,
+        token::mint = token_x,
+        token::authority = pool_state,
+        token::token_program = token_program_x,
+    )]
+    pub fee_vault_x: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    /// Penampung fee creator sisi Token Y.
+    #[account(
+        mut,
+        token::mint = token_y,
+        token::authority = pool_state,
+        token::token_program = token_program_y,
+    )]
+    pub fee_vault_y: Box<InterfaceAccount<'info, TokenAccount>>,
+
     #[account(
         mut,
         token::mint = token_x,
@@ -653,6 +867,69 @@ pub struct Swap<'info> {
         token::token_program = token_program_y,
     )]
     pub user_token_y: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    pub token_program_x: Interface<'info, TokenInterface>,
+    pub token_program_y: Interface<'info, TokenInterface>,
+}
+
+#[derive(Accounts)]
+pub struct ClaimCreatorFee<'info> {
+    /// Penerima fee — wajib sama dengan `pool_state.creator`.
+    #[account(mut)]
+    pub creator: Signer<'info>,
+
+    #[account(
+        seeds = [AMM_POOL_SEED, pool_state.token_x.as_ref(), pool_state.token_y.as_ref()],
+        bump = pool_state.bump,
+        has_one = creator @ AmmError::InvalidCreator,
+        has_one = fee_vault_x @ AmmError::InvalidFeeVault,
+        has_one = fee_vault_y @ AmmError::InvalidFeeVault,
+    )]
+    pub pool_state: Box<Account<'info, PoolState>>,
+
+    #[account(
+        address = pool_state.token_x @ AmmError::InvalidTokenMint,
+        mint::token_program = token_program_x,
+    )]
+    pub token_x: Box<InterfaceAccount<'info, Mint>>,
+
+    #[account(
+        address = pool_state.token_y @ AmmError::InvalidTokenMint,
+        mint::token_program = token_program_y,
+    )]
+    pub token_y: Box<InterfaceAccount<'info, Mint>>,
+
+    #[account(
+        mut,
+        token::mint = token_x,
+        token::authority = pool_state,
+        token::token_program = token_program_x,
+    )]
+    pub fee_vault_x: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    #[account(
+        mut,
+        token::mint = token_y,
+        token::authority = pool_state,
+        token::token_program = token_program_y,
+    )]
+    pub fee_vault_y: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    #[account(
+        mut,
+        token::mint = token_x,
+        token::authority = creator,
+        token::token_program = token_program_x,
+    )]
+    pub creator_token_x: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    #[account(
+        mut,
+        token::mint = token_y,
+        token::authority = creator,
+        token::token_program = token_program_y,
+    )]
+    pub creator_token_y: Box<InterfaceAccount<'info, TokenAccount>>,
 
     pub token_program_x: Interface<'info, TokenInterface>,
     pub token_program_y: Interface<'info, TokenInterface>,
@@ -684,4 +961,14 @@ pub enum AmmError {
     InvalidVault,
     #[msg("Provided LP mint account does not match PoolState")]
     InvalidLpMint,
+    #[msg("Signer is not the creator of this pool")]
+    InvalidCreator,
+    #[msg("Provided fee vault account does not match PoolState")]
+    InvalidFeeVault,
+    #[msg("Claim side must be 0 (both), 1 (token X) or 2 (token Y)")]
+    InvalidClaimSide,
+    #[msg("Creator fee vaults are empty — nothing to claim")]
+    NothingToClaim,
+    #[msg("Accumulated creator fee is below the requested minimum")]
+    ClaimBelowMinimum,
 }

@@ -27,17 +27,21 @@ Production-ready boilerplate untuk **DeFi Token-2022 Launchpad & Virtual Liquidi
 | `AMM initialize_pool` | `u8 = 0` | `17 B` | `[u8(0), u64_le(initial_real_token_y), u64_le(virtual_reserves_x)]` |
 | `AMM add_liquidity` | `u8 = 1` | `25 B` | `[u8(1), u64_le(amount_x), u64_le(amount_y), u64_le(min_lp_out)]` |
 | `AMM swap` | `u8 = 2` | `18 B` | `[u8(2), u64_le(amount_in), u64_le(min_amount_out), u8(x_to_y)]` |
-| `Account: PoolState` | `sha256("account:PoolState")[..8]` | `185 B` | `8B disc + 5*32B Pubkey + 2*8B u64(virtualX, virtualY) + 1B bump` |
+| `AMM claim_creator_fee` | `u8 = 3` | `10 B` | `[u8(3), u8(side), u64_le(min_amount)]` — `side`: `0`=kedua sisi, `1`=X, `2`=Y |
+| `Account: PoolState` | `sha256("account:PoolState")[..8]` | `281 B` | `8B disc + 8*32B Pubkey (mint/vault/lp/creator/fee_vault_x/fee_vault_y) + 2*8B u64(virtualX, virtualY) + 1B bump` |
 
-Anchor 0.31 mendukung **custom discriminator** 1 byte (`#[instruction(discriminator = [0])]`), sehingga payload instruksi AMM hanya 17/25/18 byte (bukan 24/32/25 byte) dan hemat ~21 byte per transaksi.
+Anchor 0.31 mendukung **custom discriminator** 1 byte (`#[instruction(discriminator = [0])]`), sehingga payload instruksi AMM hanya 17/25/18/10 byte (bukan 24/32/25/17 byte) dan hemat ~21 byte per transaksi.
+
+**Fee swap 0.30% dipecah dua:** `24 bps (0.24%)` untuk LP (tertinggal di `vault_x`/`vault_y`) + `6 bps (0.06%)` untuk **creator** pool (masuk `fee_vault_x`/`fee_vault_y`, diklaim lewat instruksi `claim_creator_fee`). Fee creator dipotong dari `amount_in` sebelum masuk vault, jadi cadangan vault dan invariant `k` tetap bersih.
 
 ### Jumlah `AccountMeta` per Instruksi
 
 | Instruksi | Akun | Keterangan |
 | :--- | :--- | :--- |
-| `initialize_pool` | 15 | `payer`, `token_x`, `token_y`, `pool_state`, `lp_mint`, `vault_x`, `vault_y`, `user_token_y`, `user_lp_token`, 3× token program, ATA program, system program, rent |
+| `initialize_pool` | 17 | `payer`, `token_x`, `token_y`, `pool_state`, `lp_mint`, `vault_x`, `vault_y`, `fee_vault_x`, `fee_vault_y`, `user_token_y`, `user_lp_token`, 3× token program, ATA program, system program, rent |
 | `add_liquidity` | 13 | `user`, 2 mint, `pool_state`, `lp_mint`, 2 vault, 3 user token account, 3 token program |
-| `swap` | 10 | `user`, 2 mint, `pool_state`, 2 vault, 2 user token account, 2 token program |
+| `swap` | 12 | `user`, 2 mint, `pool_state`, 2 vault, `fee_vault_x`, `fee_vault_y`, 2 user token account, 2 token program |
+| `claim_creator_fee` | 10 | `creator` (signer), `pool_state`, 2 mint, `fee_vault_x`, `fee_vault_y`, 2 ATA creator, 2 token program |
 
 > `buildCreatePoolTx()` mengirim **2 instruksi** dalam satu transaksi: `CreateIdempotent` ATA token Y (wajib ada sebelum CPI `transfer_checked`) + `initialize_pool`. `buildAddLiquidityTx()` dan `buildSwapTx()` juga menyertakan pembuatan ATA idempotent (plus `SystemProgram.transfer` + `SyncNative` bila sisi input adalah WSOL).
 
@@ -60,11 +64,13 @@ Anchor 0.31 mendukung **custom discriminator** 1 byte (`#[instruction(discrimina
 ├── tests/
 │   ├── verifySdk.ts             # Uji layout biner, PDA, matematika AMM & deserialisasi
 │   ├── verifyPinata.ts          # Uji upload Pinata (mock server, tanpa jaringan)
-│   └── verifyPinataApi.ts       # Uji dev API /api/pinata/* (mock server)
+│   ├── verifyPinataApi.ts       # Uji dev API /api/pinata/* (mock server)
+│   └── verifyClaimCreator.ts    # Uji CLI claim fee creator (mock RPC/ledger)
 ├── scripts/
 │   ├── devnetPreflight.ts       # Cek kesiapan devnet (RPC, program, saldo)
 │   ├── pinataUpload.ts          # CLI upload gambar + metadata JSON ke IPFS (Pinata)
-│   └── pinataDevApi.ts          # Dev API /api/pinata/* (Vite middleware, upload dari UI)
+│   ├── pinataDevApi.ts          # Dev API /api/pinata/* (Vite middleware, upload dari UI)
+│   └── claimCreatorFee.ts       # CLI klaim fee creator 0.06% (dry-run/--execute)
 ├── index.html
 ├── tailwind.config.js           # content: index.html + src/**/*.{ts,tsx}
 ├── tsconfig.json                # include: src, tests
@@ -177,6 +183,71 @@ Catatan:
 Uji otomatis (tanpa kredensial, memakai mock server lokal): `npm test` — menjalankan tiga
 suite: layout biner AMM, CLI upload Pinata, dan dev API `/api/pinata/*`.
 
+## Fee Creator (0.06%) & Cara Klaim
+
+Setiap swap membebankan **0.30%**, dipecah otomatis di dalam program:
+
+| Bagian | Porsi | Tujuan |
+| :--- | :--- | :--- |
+| LP | `24 bps` (0.24%) | tertinggal di `vault_x` / `vault_y` → memperbesar `k`, milik LP |
+| **Creator** | `6 bps` (0.06%) | masuk `fee_vault_x` / `fee_vault_y` (PDA milik `pool_state`) |
+
+Bagian creator **tidak** menyentuh cadangan vault, jadi harga/`k` tetap konsisten.
+Akun `fee_vault_x`/`fee_vault_y` juga divalidasi lewat `has_one` di `swap` dan
+`claim_creator_fee`, sehingga vault palsu ditolak dengan error `InvalidFeeVault`. Wallet yang
+membuat pool (`initialize_pool` → `payer`) otomatis menjadi `creator` di `PoolState` dan
+satu-satunya pihak yang boleh menarik fee tersebut.
+
+### Klaim lewat CLI (disarankan)
+
+```bash
+# 1. Cek dulu tanpa mengirim transaksi (dry-run + simulasi preflight)
+npm run claim:creator -- --pool <POOL_PDA>
+
+# 2. Kirim sungguhan
+npm run claim:creator -- --pool <POOL_PDA> --execute
+
+# Opsi lain
+npm run claim:creator -- --pool <POOL_PDA> --side y     # hanya sisi token Y
+npm run claim:creator -- --pool <POOL_PDA> --min 0.001  # minimal 0.001 SOL terkumpul
+npm run claim:creator -- --pool <POOL_PDA> --keypair ~/.config/solana/id.json
+npm run claim:creator -- --pool <POOL_PDA> --rpc https://api.devnet.solana.com
+```
+
+Contoh keluaran:
+
+```
+RPC     : https://api.devnet.solana.com
+Wallet  : 7xKX...9fQ
+
+Pool    : 4MMLhXNXnyEtA5inVcHGLXBrYcVUsWn8ko5ai7PnDbZC
+Creator : 7xKX...9fQ
+Fee X   : 0.031500 SOL (WSOL)
+Fee Y   : 0.087000 token
+Sisi    : BOTH
+Simulasi preflight: OK
+Mode dry-run — tambahkan --execute untuk benar-benar mengirim transaksi.
+```
+
+Script akan: membaca `PoolState` (281 B) → memastikan wallet = `creator` → menampilkan saldo
+`fee_vault_x`/`fee_vault_y` → menyusun transaksi `claim_creator_fee` (disc `3`, payload 10 B,
+plus `CreateIdempotent` ATA creator) → simulasi preflight → (dengan `--execute`) kirim,
+konfirmasi, lalu mencetak signature + tautan explorer.
+
+### Klaim lewat dashboard
+
+Panel pool menampilkan kartu **Fee Creator** berisi nominal siap klaim X (SOL) dan Y (token)
+serta tombol **Claim Fee**. Tombol hanya aktif bila wallet aktif = `creator` pool.
+
+### Syarat & error umum
+
+- Program AMM harus sudah ter-deploy (`npm run devnet:check`) — kalau belum, transaksi akan
+  ditolak dengan pesan "program belum ter-deploy".
+- `Wallet ... bukan creator pool ini` → jalankan dengan keypair pembuat pool (`--keypair`).
+- `Belum ada fee creator yang terakumulasi` → fee 0.06% baru terisi setelah ada swap.
+- Di mode **Binary Sandbox**, tombol Claim hanya mengosongkan fee vault pada ledger lokal
+  (tidak ada transaksi on-chain).
+
 ## Instal dari Nol di Linux (belum ada Node.js)
 
 Node.js dari repo distro sering terlalu tua untuk Vite 6. Pakai **nvm** (tanpa sudo, tidak mengganggu paket sistem):
@@ -225,11 +296,13 @@ npm run typecheck# Type-check ketat TypeScript (strict, noUnusedLocals)
 npm run build    # Type-check + build produksi Vite (dist/)
 npm run dev      # Dashboard interaktif di http://localhost:5173 (0.0.0.0)
 
+npm run claim:creator -- --pool <POOL_PDA>   # Cek fee creator yang bisa diklaim (dry-run)
+
 anchor build     # Build smart contract Rust (butuh Solana + Anchor CLI 0.31.1)
 anchor deploy    # Deploy program mini_amm ke devnet
 ```
 
-Mode **Binary Sandbox** di dashboard menjalankan seluruh pipeline (mint Token-2022 → inisialisasi pool → swap → deserialisasi 185B `PoolState`) terhadap ledger in-memory dengan serialisasi instruksi yang **sama persis** seperti transaksi on-chain; mode **Devnet RPC** mengirim transaksi sungguhan melalui wallet (Phantom atau keypair ephemeral).
+Mode **Binary Sandbox** di dashboard menjalankan seluruh pipeline (mint Token-2022 → inisialisasi pool → swap → deserialisasi 281B `PoolState`) terhadap ledger in-memory dengan serialisasi instruksi yang **sama persis** seperti transaksi on-chain; mode **Devnet RPC** mengirim transaksi sungguhan melalui wallet (Phantom atau keypair ephemeral).
 
 ## Menjalankan di Devnet (Checklist)
 
@@ -313,6 +386,8 @@ Selain itu dashboard mencetak ringkasan layout transaksi ke console (`console.ta
 - `buildCreatePoolTx()` kini membuat ATA token Y lebih dulu (sebelumnya transaksi gagal `AccountNotInitialized` bila pengguna belum punya ATA).
 - `buildMintToCheckedInstruction()` sebelumnya mengirim **4** `AccountMeta` (menyisipkan `mint` read-only di indeks 1, layout `TransferChecked`). Token-2022 lalu membaca akun **Mint** sebagai `destination`, sehingga transaksi gagal `Error processing Instruction 8: instruction requires an initialized account` (`Program log: Error: UninitializedAccount`). Sekarang layout benar: `[mint, destination ATA, mint_authority]`, dan ada uji regresi yang memastikan `destination` sama dengan ATA hasil `CreateIdempotent` sebelumnya.
 - Pesan error preflight kini mengenali `UninitializedAccount` dan menyebut nomor instruksi yang gagal beserta saran perbaikannya.
+- **Fee creator**: `PoolState` naik ke 281 B (`creator`, `fee_vault_x`, `fee_vault_y`), `initialize_pool` kini 17 akun, `swap` 12 akun, dan ada instruksi baru `claim_creator_fee` (disc `3`). Fee swap 0.30% dipecah 0.24% LP + 0.06% creator tanpa mengubah invariant `k`. Ditambah CLI `npm run claim:creator`, kartu Fee Creator di dashboard, dan uji `tests/verifyClaimCreator.ts`.
+- Header dashboard menampilkan stempel build (`SDK_BUILD_TAG`) + `console.table` ringkasan instruksi agar mudah memastikan bundle yang berjalan sudah terbaru.
 - Dashboard: kegagalan swap tidak lagi ditandai `SUCCESS`, dan estimasi quote pembelian awal memakai cadangan efektif yang benar.
 - Uji tambahan: edge-case parser/matematika, ukuran transaksi, dan konsistensi `LP_awal = sqrt(k)`.
 
