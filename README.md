@@ -63,6 +63,45 @@ Anchor 0.31 mendukung **custom discriminator** 1 byte (`#[instruction(discrimina
 └── vite.config.ts
 ```
 
+## Instal dari Nol di Linux (belum ada Node.js)
+
+Node.js dari repo distro sering terlalu tua untuk Vite 6. Pakai **nvm** (tanpa sudo, tidak mengganggu paket sistem):
+
+```bash
+# 1. Prasyarat (biasanya sudah ada di Kali)
+sudo apt update && sudo apt install -y curl git
+
+# 2. Pasang nvm + Node.js 22 LTS
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
+source ~/.bashrc
+nvm install 22 && nvm use 22
+
+# 3. Cek versi (harus Node >= 18)
+node -v   # v22.x
+npm -v    # 10.x
+
+# 4. Ambil proyek & pasang dependensi
+git clone https://github.com/SLREV/mini-defi-customsdk.git
+cd mini-defi-customsdk
+npm install
+
+# 5. Jalankan
+npm run dev
+```
+
+Buka `http://localhost:5173`, biarkan mode **Binary Sandbox**, klik **Connect Mock Keypair**, lalu **Launch Token-2022 & Virtual Pool**.
+Tidak perlu wallet, SOL, RPC, atau program ter-deploy — seluruh pipeline berjalan di ledger in-memory.
+
+Cek kesehatan instalasi kapan saja:
+
+```bash
+npm test        # harus mencetak: ALL TOKEN-2022 & VIRTUAL LIQUIDITY AMM BINARY TESTS PASSED!
+npm run build   # type-check ketat + build produksi ke dist/
+```
+
+> Jika Kali berjalan di VM/container dan browser ada di host, akses lewat `http://<IP-Kali>:5173`
+> (server sudah bind ke `0.0.0.0`) dan buka port bila perlu: `sudo ufw allow 5173/tcp`.
+
 ## Perintah Menjalankan Proyek
 
 ```bash
