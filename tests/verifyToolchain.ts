@@ -67,14 +67,15 @@ assert.equal(solanaVersionSupportsEdition2024(null), false);
 // 4. Laporan untuk toolchain modern: OK + binary siap
 const okRoot = mkdtempSync(join(tmpdir(), 'doctor-ok-'));
 writeFileSync(join(okRoot, 'Anchor.toml'), '[toolchain]\nsolana_version = "4.4.1"\n');
-writeFileSync(join(okRoot, 'Cargo.toml'), '[workspace]\nresolver = "3"\n');
+writeFileSync(join(okRoot, 'Cargo.toml'), '[workspace]\nresolver = "2"\n');
 mkdirSync(join(okRoot, '.cargo'), { recursive: true });
 writeFileSync(join(okRoot, '.cargo', 'config.toml'), '[resolver]\nincompatible-rust-versions = "fallback"\n');
 mkdirSync(join(okRoot, 'target', 'deploy'), { recursive: true });
 writeFileSync(join(okRoot, 'target', 'deploy', 'mini_amm.so'), 'x');
 
 const ok = inspectToolchain(okRoot);
-assert.equal(ok.resolver, '3');
+assert.equal(ok.resolver, '2');
+assert.equal(ok.anchorManifestIncompatible, false);
 assert.equal(ok.msrvAwareResolver, true);
 assert.equal(ok.anchorSolanaVersion, '4.4.1');
 // Tanpa cargo-build-sbf di PATH, verdict-nya "missing-binary" tetapi hint binary tetap benar.
@@ -83,20 +84,39 @@ assert.ok(ok.hints.some((h) => h.includes('Binary siap deploy')));
 
 // 5. Laporan untuk repo tanpa perlindungan MSRV: hint resolver 3 muncul
 const bareRoot = mkdtempSync(join(tmpdir(), 'doctor-bare-'));
-writeFileSync(join(bareRoot, 'Cargo.toml'), '[workspace]\nresolver = "2"\n');
+writeFileSync(join(bareRoot, 'Cargo.toml'), '[workspace]\nresolver = "1"\n');
 
 const bare = inspectToolchain(bareRoot);
-assert.equal(bare.resolver, '2');
+assert.equal(bare.resolver, '1');
 assert.equal(bare.msrvAwareResolver, false);
 assert.ok(
   bare.hints.some((h) => h.includes('mini_amm.so belum ada')),
   'harus menyebut binary yang hilang'
 );
 
-// 6. Repo asli: konfigurasi yang dikomit memang MSRV-aware
+// 6. resolver = "3" (ditolak Anchor 0.31.1 / cargo_toml 0.19) harus terdeteksi
+const badRoot = mkdtempSync(join(tmpdir(), 'doctor-resolver3-'));
+writeFileSync(join(badRoot, 'Cargo.toml'), '[workspace]\nresolver = "3"\n');
+writeFileSync(join(badRoot, 'Anchor.toml'), '[toolchain]\nsolana_version = "4.4.1"\n');
+const bad = inspectToolchain(badRoot);
+assert.equal(bad.resolver, '3');
+assert.equal(bad.anchorManifestIncompatible, true);
+assert.ok(
+  bad.hints.some((h) => h.includes('DITOLAK Anchor 0.31.1')),
+  'harus menyebut resolver 3 ditolak Anchor'
+);
+// Hanya "1"/"2" yang dikenali cargo_toml 0.19 (enum Resolver = V1 | V2).
+assert.ok(!['1', '2'].includes('3'), 'resolver 3 harus dianggap tidak kompatibel');
+
+// 7. Repo asli: konfigurasi yang dikomit memang MSRV-aware
 const repoRoot = fileURLToPath(new URL('..', import.meta.url));
 const repo = inspectToolchain(repoRoot);
-assert.equal(repo.resolver, '3', 'Cargo.toml root wajib resolver = "3"');
+assert.equal(repo.resolver, '2', 'Cargo.toml root wajib resolver = "2" (Anchor 0.31.1 menolak "3")');
+assert.equal(
+  repo.anchorManifestIncompatible,
+  false,
+  'manifest tidak boleh memakai resolver yang ditolak Anchor 0.31.1'
+);
 assert.equal(repo.msrvAwareResolver, true, 'harus ada resolver 3 atau cargo config');
 assert.equal(repo.anchorSolanaVersion, '4.4.1', 'Anchor.toml wajib mematok solana_version 4.4.1');
 assert.equal(

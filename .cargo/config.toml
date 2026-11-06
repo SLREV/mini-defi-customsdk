@@ -1,13 +1,16 @@
-# Cadangan kedua untuk `resolver = "3"` di Cargo.toml.
+# Resolver MSRV-aware milik Cargo (stabil sejak Cargo 1.84).
 #
-# `incompatible-rust-versions = "fallback"` (stabil sejak Cargo 1.84) membuat
-# Cargo lebih memilih versi dependency yang masih bisa dibangun oleh toolchain
-# kita, alih-alih mengambil versi terbaru yang butuh rustc/Cargo lebih baru.
+# `incompatible-rust-versions = "fallback"` membuat Cargo memilih versi
+# dependency terbaru yang masih bisa dibangun oleh MSRV workspace, bukan versi
+# terbaru mutlak. Ini lapisan pertahanan terhadap error:
 #
-# Kasus yang ditangani: `anchor build` gagal dengan
 #   error: failed to parse manifest at `.../zeroize_derive-1.5.0/Cargo.toml`
 #   Caused by: feature `edition2024` is required
-# karena Cargo 1.84 (bawaan platform-tools SBF) belum mengenal edition 2024.
+#
+# Kenapa di sini, bukan `resolver = "3"` di Cargo.toml: Anchor 0.31.1 mem-parse
+# Cargo.toml dengan `cargo_toml 0.19` yang hanya mengenal resolver 1 dan 2,
+# sehingga `resolver = "3"` membuat `anchor build`/`anchor deploy` gagal dengan
+# "unknown variant `3`". File ini hanya dibaca Cargo asli.
 #
 # Jangan dihapus kecuali `cargo-build-sbf --version` sudah melaporkan rustc >= 1.85.
 [resolver]

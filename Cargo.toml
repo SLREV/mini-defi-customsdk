@@ -1,16 +1,22 @@
 [workspace]
 members = ["programs/*"]
-# Resolver 3 = "MSRV-aware resolver" (stabil di Cargo 1.84). Cargo memilih versi
-# dependency terbaru yang `rust-version`-nya masih cocok dengan workspace, bukan
-# sekadar versi terbaru. Ini yang mencegah `zeroize_derive 1.5`, `blake3 1.8.3`,
-# `constant_time_eq 0.4.2`, dst. (semuanya edition 2024) ikut ter-resolve saat
-# build SBF memakai Cargo 1.84 bawaan platform-tools.
-resolver = "3"
+# JANGAN memakai `resolver = "3"` di sini.
+#
+# Anchor 0.31.1 membaca Cargo.toml memakai crate `cargo_toml 0.19`, yang enum
+# Resolver-nya hanya punya V1/V2. Akibatnya `anchor build` / `anchor deploy`
+# gagal sebelum build:
+#
+#   Error reading manifest from path: .../Cargo.toml
+#   TOML parse error at line N: unknown variant `3`, expected `1` or `2`
+#
+# Resolver MSRV-aware tetap aktif lewat `.cargo/config.toml`
+# (`[resolver] incompatible-rust-versions = "fallback"`), yang dibaca Cargo asli
+# dan tidak pernah di-parse oleh Anchor.
+resolver = "2"
 
 [workspace.package]
-# Versi rustc/Cargo yang dibawa platform-tools (yang dipakai `cargo-build-sbf`
-# lewat `anchor build`). Dinaikkan hanya setelah toolchain SBF-nya ikut naik
-# (lihat README "Gagal `anchor build`: feature `edition2024`").
+# MSRV workspace untuk resolver MSRV-aware milik Cargo.
+# Naikkan hanya setelah `cargo-build-sbf --version` melaporkan rustc >= 1.85.
 rust-version = "1.84"
 
 [profile.release]
