@@ -123,6 +123,10 @@ async function main(): Promise<void> {
     ).json()) as { configured: boolean; message: string };
     assert.equal(statusMissing.configured, false);
     assert.match(statusMissing.message, /Kredensial Pinata belum diset/);
+    assert.match(statusMissing.message, /PINATA_JWT/);
+    assert.match(statusMissing.message, /restart npm run dev/);
+    // pesan harus satu baris (tidak membawa detail multi-baris dari CLI)
+    assert.ok(!statusMissing.message.includes('\n'), 'pesan status harus satu baris');
 
     // 3) method salah -> 405
     const notPost = await fetch(`${api.base}/api/pinata/upload`, { method: 'GET' });

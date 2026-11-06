@@ -205,6 +205,23 @@ function resolveConfig(options: DevApiOptions): PinataConfig {
 // HANDLER HTTP (kompatibel dengan connect/Vite middleware)
 // ============================================================================
 
+/**
+ * Ubah error konfigurasi (yang di CLI berupa pesan multi-baris) menjadi satu kalimat
+ * pendek yang aman ditampilkan di dashboard.
+ */
+export function describeCredentialError(err: unknown): string {
+  const hint =
+    'Isi PINATA_JWT (atau PINATA_API_KEY + PINATA_API_SECRET) di .env, lalu restart npm run dev.';
+  const raw = err instanceof Error ? err.message : '';
+  const first = raw.split('\n')[0].trim().replace(/:$/, '');
+  // Pesan kredensial dari CLI sudah memuat kalimat "Isi salah satu di .env",
+  // jadi cukup pakai kalimat baku agar tidak berulang.
+  if (!first || /kredensial pinata belum diset/i.test(first)) {
+    return `Kredensial Pinata belum diset. ${hint}`;
+  }
+  return `${first}. ${hint}`;
+}
+
 export function createStatusHandler(
   options: DevApiOptions = {}
 ): (req: IncomingMessage, res: ServerResponse) => void {
@@ -224,10 +241,7 @@ export function createStatusHandler(
       sendJson(res, 200, {
         configured: false,
         gateway: null,
-        message:
-          err instanceof Error
-            ? `${err.message.split('\n')[0]} — isi .env lalu restart npm run dev`
-            : 'Kredensial Pinata belum diset — isi .env lalu restart npm run dev',
+        message: describeCredentialError(err),
       });
     }
   };
@@ -249,10 +263,7 @@ export function createUploadHandler(
         try {
           config = resolveConfig(options);
         } catch (err) {
-          throw new DevApiError(
-            503,
-            `${err instanceof Error ? err.message.split('\n')[0] : 'Kredensial Pinata belum diset'} — isi .env lalu restart npm run dev`
-          );
+          throw new DevApiError(503, describeCredentialError(err));
         }
 
         const raw = await readBody(req);
