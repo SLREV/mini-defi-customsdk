@@ -28,6 +28,7 @@ import {
   TOKEN_PROGRAM_ID,
   calculateInitialLpTokens,
   calculateSwapOutput,
+  calculateToken2022MintTotalBytes,
   formatTokenAmount,
   integerSqrtBigInt,
   parseTokenAmount,
@@ -115,6 +116,43 @@ async function main(): Promise<void> {
   );
   assert.equal(clone.instructions[7].data.byteLength, 10);
   assert.equal(clone.instructions[7].data[0], 14); // MintToChecked
+  // Tanpa metadataUri, `uri` on-chain memakai URL gambar
+  assert.equal(clone.resolvedMetadataUri, clone.offchainMetadataJson.image);
+
+  // 3b. metadataUri (hasil `npm run pinata:upload`): `uri` on-chain -> JSON metadata,
+  //     sedangkan `image` di dalam JSON tetap URL gambar.
+  const metadataJsonUri =
+    'https://nusantara-gateway.mypinata.cloud/ipfs/QmMetadataHashUji1234567890abcdefghijklmnopqrstuvwxyz';
+  const cloneWithJson = await sdk.buildCloneTokenInstructions({
+    payer: payer.publicKey,
+    name: 'Nusantara Token 2022',
+    symbol: 'NUSA',
+    imageUri: clone.offchainMetadataJson.image,
+    metadataUri: metadataJsonUri,
+    telegram: 'https://t.me/nusa_2022',
+    twitter: 'https://x.com/nusa_2022',
+    decimals: 9,
+    initialSupplyRaw: supplyRaw,
+    tokenStandard: 'TOKEN_2022',
+  });
+  assert.equal(cloneWithJson.resolvedMetadataUri, metadataJsonUri);
+  assert.equal(cloneWithJson.offchainMetadataJson.image, clone.offchainMetadataJson.image);
+  // instruksi TokenMetadata::Initialize memuatan uri JSON, bukan URL gambar
+  assert.ok(
+    cloneWithJson.instructions[3].data.includes(Buffer.from(metadataJsonUri, 'utf8')),
+    'uri JSON harus tertanam pada instruksi initialize metadata'
+  );
+  // ukuran akun mint mengikuti uri yang lebih panjang (agar realloc tidak gagal)
+  assert.equal(
+    cloneWithJson.allocatedMintBytes,
+    calculateToken2022MintTotalBytes({
+      name: 'Nusantara Token 2022',
+      symbol: 'NUSA',
+      uri: metadataJsonUri,
+      additionalMetadata: cloneWithJson.additionalMetadata,
+    })
+  );
+  assert.ok(cloneWithJson.allocatedMintBytes > clone.allocatedMintBytes);
 
   // 4. Uji buildCreatePoolTx (Discriminator 0, 17B payload, 15 AccountMeta lintas TokenProgram)
   const createPool = await sdk.buildCreatePoolTx({
