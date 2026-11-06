@@ -283,9 +283,10 @@ browser masih memakai bundle lama — bukan bug baru:
 Cek cepat dari terminal bahwa layout `MintToChecked` sudah benar (harus **3** akun):
 
 ```bash
-grep -A12 "public buildMintToCheckedInstruction" src/sdk/customSdk.ts | grep -c "pubkey: mint"
-# hasil 1  -> layout baru (3 akun)
-# hasil 2  -> masih layout lama (4 akun, menyebabkan UninitializedAccount)
+awk '/public buildMintToCheckedInstruction/,/^  \}$/' src/sdk/customSdk.ts \
+  | grep -c "pubkey: mint,"
+# hasil 1  -> layout baru  (3 akun: mint, destination ATA, mint_authority)
+# hasil 2  -> layout lama   (4 akun -> UninitializedAccount di instruksi 8)
 ```
 
 Selain itu dashboard mencetak ringkasan layout transaksi ke console (`console.table`):
