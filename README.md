@@ -58,10 +58,12 @@ Anchor 0.31 mendukung **custom discriminator** 1 byte (`#[instruction(discrimina
 │   └── sdk/customSdk.ts         # SDK biner murni (buffer-layout, tanpa SDK pihak ketiga)
 ├── tests/
 │   ├── verifySdk.ts             # Uji layout biner, PDA, matematika AMM & deserialisasi
-│   └── verifyPinata.ts          # Uji upload Pinata (mock server, tanpa jaringan)
+│   ├── verifyPinata.ts          # Uji upload Pinata (mock server, tanpa jaringan)
+│   └── verifyPinataApi.ts       # Uji dev API /api/pinata/* (mock server)
 ├── scripts/
 │   ├── devnetPreflight.ts       # Cek kesiapan devnet (RPC, program, saldo)
-│   └── pinataUpload.ts          # Upload gambar + metadata JSON ke IPFS (Pinata)
+│   ├── pinataUpload.ts          # CLI upload gambar + metadata JSON ke IPFS (Pinata)
+│   └── pinataDevApi.ts          # Dev API /api/pinata/* (Vite middleware, upload dari UI)
 ├── index.html
 ├── tailwind.config.js           # content: index.html + src/**/*.{ts,tsx}
 ├── tsconfig.json                # include: src, tests
@@ -107,6 +109,41 @@ metadataUri : https://gateway.pinata.cloud/ipfs/QmMetadata...
 Opsi lain: `--description`, `--website`, `--out <path>` (default `pinata-upload-result.json`,
 sudah di-.gitignore), `--help`.
 
+### Upload langsung dari dashboard (`npm run dev`)
+
+Ada dua cara memakai Pinata. **Cara A** (di bawah) paling sederhana: satu perintah terminal.
+**Cara B** ini membuat dashboard bisa upload sendiri lewat file picker.
+
+```bash
+cp .env.example .env      # isi PINATA_JWT (atau key/secret)
+npm run dev               # log akan menampilkan: ✓ Pinata dev API aktif
+```
+
+Di dashboard, bagian **“Upload gambar ke IPFS (Pinata)”**:
+
+1. Badge menunjukkan **PINATA SIAP** (hijau) bila kredensial terbaca, atau
+   **BELUM DIKONFIGURASI** (kuning) beserta alasannya.
+2. Pilih file gambar → gambar + JSON metadata diunggah otomatis.
+3. Kolom **Image URI** dan **Metadata JSON URI** langsung terisi (`imageUri` / `metadataUri`).
+4. Klik **Launch Token-2022 & Virtual Pool**.
+
+Cara kerjanya: browser **tidak pernah** memegang secret. Ia memanggil endpoint di dev server
+(`scripts/pinataDevApi.ts`, Vite middleware), lalu server membaca `PINATA_JWT` dari `.env` dan
+meneruskan upload ke Pinata memakai pipeline yang sama dengan CLI.
+
+| Endpoint (dev only) | Keterangan |
+| :--- | :--- |
+| `GET /api/pinata/status` | `{ configured, gateway, message }` — untuk badge di UI |
+| `POST /api/pinata/upload` | body `{ fileName, base64, name, symbol, telegram?, twitter?, website?, description? }` → `{ imageUri, metadataUri, imageHash, metadataHash }` |
+
+Kode status: `400` input tidak valid, `405` method salah, `413` body terlalu besar,
+`502` Pinata menolak (mis. 401), `503` kredensial belum diset.
+
+> **Batasan:** middleware ini hanya aktif di `npm run dev`. Hasil `npm run build`
+> (`npm run preview`) **tidak** menyertakan `/api/pinata/*` — untuk produksi, pindahkan
+> handler yang sama ke backend sungguhan (Express/serverless) dan simpan JWT sebagai
+> environment variable server.
+
 ### Memakai hasilnya di dashboard
 
 | Kolom di dashboard | Nilai yang ditempel |
@@ -136,7 +173,8 @@ Catatan:
 | Metadata tidak tampil di wallet | Pastikan `uri` on-chain = `metadataUri` (JSON), bukan URL gambar langsung. |
 | `Kredensial Pinata belum diset` | `.env` belum dibuat/terisi, atau dijalankan dari direktori yang salah. |
 
-Uji otomatis (tanpa kredensial, memakai mock server lokal): `npm test`.
+Uji otomatis (tanpa kredensial, memakai mock server lokal): `npm test` — menjalankan tiga
+suite: layout biner AMM, CLI upload Pinata, dan dev API `/api/pinata/*`.
 
 ## Instal dari Nol di Linux (belum ada Node.js)
 
@@ -273,3 +311,8 @@ Tips pemakaian di dashboard:
   `imageUri` (gambar di dalam JSON). Dashboard punya kolom **Metadata JSON URI**.
 - `tests/verifyPinata.ts`: uji parser `.env`, validasi file/argumen, bentuk metadata,
   pipeline upload end-to-end vs mock server HTTP, dan penanganan 401.
+- `scripts/pinataDevApi.ts`: dev API `GET /api/pinata/status` + `POST /api/pinata/upload`
+  (Vite middleware) agar dashboard bisa upload lewat file picker tanpa pernah memegang secret;
+  kolom Image URI & Metadata JSON URI terisi otomatis.
+- `tests/verifyPinataApi.ts`: uji endpoint dev (status, 405/400/413/503/502/200) terhadap
+  mock Pinata, termasuk pembersihan file sementara.

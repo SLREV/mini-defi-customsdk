@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   AccountInfo,
   Commitment,
@@ -209,6 +209,14 @@ export default function App(): React.ReactElement {
   );
   // URI JSON metadata (mis. hasil `npm run pinata:upload`); opsional.
   const [metadataUri, setMetadataUri] = useState<string>('');
+
+  // Upload gambar ke IPFS lewat dev API `/api/pinata/upload` (khusus `npm run dev`).
+  const [pinataUploadBusy, setPinataUploadBusy] = useState<boolean>(false);
+  const [pinataUploadError, setPinataUploadError] = useState<string | null>(null);
+  const [pinataStatus, setPinataStatus] = useState<{
+    configured: boolean;
+    message: string;
+  } | null>(null);
   const [telegram, setTelegram] = useState<string>('https://t.me/nusa_2022');
   const [twitter, setTwitter] = useState<string>('https://x.com/nusa_2022');
   const [totalSupply, setTotalSupply] = useState<string>('1000000000');
@@ -283,6 +291,87 @@ export default function App(): React.ReactElement {
       return;
     }
     setSolBalance(await readSolBalance(conn, pubkey));
+  };
+
+  // Cek kesiapan endpoint Pinata di dev server (tidak tersedia di build produksi).
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await fetch('/api/pinata/status');
+        const data = (await res.json()) as { configured?: boolean; message?: string };
+        if (!cancelled) {
+          setPinataStatus({
+            configured: data.configured === true,
+            message: data.message ?? '',
+          });
+        }
+      } catch {
+        if (!cancelled) {
+          setPinataStatus({
+            configured: false,
+            message:
+              'Endpoint upload Pinata hanya aktif saat `npm run dev` (bukan build produksi).',
+          });
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  /**
+   * Unggah gambar token ke IPFS via Pinata lewat dev API, lalu isi otomatis
+   * kolom Image URI (`imageUri`) dan Metadata JSON URI (`metadataUri`).
+   */
+  const handlePinataUpload = async (file: File): Promise<void> => {
+    setPinataUploadError(null);
+    setPinataUploadBusy(true);
+    try {
+      const base64 = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const raw = String(reader.result ?? '');
+          const comma = raw.indexOf(',');
+          resolve(comma >= 0 ? raw.slice(comma + 1) : raw);
+        };
+        reader.onerror = () => reject(new Error('Gagal membaca file dari disk'));
+        reader.readAsDataURL(file);
+      });
+
+      const res = await fetch('/api/pinata/upload', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          fileName: file.name,
+          base64,
+          name: tokenName,
+          symbol: ticker,
+          telegram,
+          twitter,
+        }),
+      });
+
+      const data = (await res.json()) as {
+        imageUri?: string;
+        metadataUri?: string;
+        error?: string;
+        detail?: string;
+      };
+
+      if (!res.ok || !data.imageUri || !data.metadataUri) {
+        throw new Error(data.detail ? `${data.error}: ${data.detail}` : (data.error ?? `HTTP ${res.status}`));
+      }
+
+      setImageUri(data.imageUri);
+      setMetadataUri(data.metadataUri);
+      setStatusBanner('Gambar & metadata berhasil diunggah ke IPFS via Pinata');
+    } catch (err) {
+      setPinataUploadError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setPinataUploadBusy(false);
+    }
   };
 
   const handleConnectWallet = async (preferInjected: boolean): Promise<void> => {
@@ -1207,6 +1296,59 @@ export default function App(): React.ReactElement {
                     className="w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 font-mono text-sm uppercase text-zinc-100 outline-none focus:border-emerald-500"
                   />
                 </div>
+              </div>
+
+              <div className="rounded-lg border border-dashed border-zinc-700 bg-zinc-950/60 p-3">
+                <div className="mb-1 flex flex-wrap items-center justify-between gap-2">
+                  <label className="block text-xs font-medium text-zinc-300">
+                    Upload gambar ke IPFS (Pinata)
+                  </label>
+                  {pinataStatus && (
+                    <span
+                      className={`rounded border px-1.5 py-0.5 font-mono text-[10px] ${
+                        pinataStatus.configured
+                          ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
+                          : 'border-amber-400/40 bg-amber-400/10 text-amber-300'
+                      }`}
+                      title={pinataStatus.message}
+                    >
+                      {pinataStatus.configured ? 'PINATA SIAP' : 'BELUM DIKONFIGURASI'}
+                    </span>
+                  )}
+                </div>
+
+                <input
+                  type="file"
+                  accept="image/png,image/jpeg,image/gif,image/webp,image/svg+xml"
+                  disabled={pinataUploadBusy || isBusy}
+                  onChange={(e) => {
+                    const file = e.target.files?.[0];
+                    if (file) void handlePinataUpload(file);
+                    e.target.value = '';
+                  }}
+                  className="block w-full text-xs text-zinc-300 file:mr-3 file:cursor-pointer file:rounded-md file:border-0 file:bg-emerald-500 file:px-3 file:py-1.5 file:text-xs file:font-semibold file:text-zinc-950 disabled:opacity-50"
+                />
+
+                {pinataUploadBusy && (
+                  <p className="mt-1 text-[11px] text-amber-300">
+                    Mengunggah gambar + metadata ke IPFS...
+                  </p>
+                )}
+                {pinataUploadError && (
+                  <p className="mt-1 text-[11px] text-rose-300">{pinataUploadError}</p>
+                )}
+                {!pinataUploadError && !pinataUploadBusy && pinataStatus && !pinataStatus.configured && (
+                  <p className="mt-1 text-[11px] text-zinc-500">
+                    {pinataStatus.message} — alternatif: tempel URL hasil
+                    <code className="mx-1 text-zinc-400">npm run pinata:upload</code>
+                    ke kolom di bawah.
+                  </p>
+                )}
+                {!pinataUploadError && !pinataUploadBusy && pinataStatus?.configured && (
+                  <p className="mt-1 text-[11px] text-zinc-500">
+                    Pilih file &rarr; kedua kolom URI di bawah terisi otomatis.
+                  </p>
+                )}
               </div>
 
               <div>
