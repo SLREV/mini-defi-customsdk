@@ -57,6 +57,13 @@ export const SPL_TOKEN_ACCOUNT_SIZE = 165;
 export const TOKEN_2022_MINT_METADATA_POINTER_SIZE = 234;
 
 /**
+ * Stempel versi layout instruksi SDK. Ditampilkan di header dashboard supaya
+ * bisa dipastikan browser benar-benar menjalankan kode terbaru (bukan bundle lama),
+ * mis. setelah perbaikan layout `MintToChecked` (3 akun, bukan 4).
+ */
+export const SDK_BUILD_TAG = '2026.11.06 · mintToChecked=3akun';
+
+/**
  * Ukuran akun `PoolState` di `src/lib.rs`:
  * 8B discriminator + 5 * 32B Pubkeys (160B) + 2 * 8B u64 (16B) + 1B bump = 185 bytes
  */

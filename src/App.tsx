@@ -7,9 +7,12 @@ import {
   Keypair,
   LAMPORTS_PER_SOL,
   PublicKey,
+  SystemProgram,
   Transaction,
+  TransactionInstruction,
 } from '@solana/web3.js';
 import {
+  ASSOCIATED_TOKEN_PROGRAM_ID,
   CustomDefiSDK,
   DEFAULT_AMM_PROGRAM_ID,
   DEFAULT_TOKEN_DECIMALS,
@@ -21,6 +24,7 @@ import {
   SPL_MINT_ACCOUNT_LAYOUT,
   SPL_MINT_SIZE,
   SPL_TOKEN_ACCOUNT_LAYOUT,
+  SDK_BUILD_TAG,
   SPL_TOKEN_ACCOUNT_SIZE,
   TOKEN_2022_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
@@ -146,6 +150,58 @@ const describeRpcError = (err: unknown, rpcEndpoint: string): string => {
     return `Instruksi ${failedIx ?? '?'} gagal: ada akun token (mint / ATA / vault) yang belum terinisialisasi — cek urutan CreateIdempotent ATA sebelum MintTo/TransferChecked.${tail}`;
   }
   return logs && logs.length > 0 ? `${raw}\nLog: ${logs.slice(-3).join(' | ')}` : raw;
+};
+
+const programLabel = (ix: TransactionInstruction): string => {
+  const id = ix.programId;
+  if (id.equals(TOKEN_2022_PROGRAM_ID)) return 'Token-2022';
+  if (id.equals(TOKEN_PROGRAM_ID)) return 'SPL Token';
+  if (id.equals(ASSOCIATED_TOKEN_PROGRAM_ID)) return 'ATA';
+  if (id.equals(SystemProgram.programId)) return 'System';
+  if (id.equals(ComputeBudgetProgram.programId)) return 'ComputeBudget';
+  return id.toBase58().slice(0, 8) + '…';
+};
+
+/** Cetak ringkasan layout transaksi ke console (bantu debugging instruksi mana yang gagal). */
+const logTxLayout = (
+  label: string,
+  instructions: TransactionInstruction[]
+): void => {
+  console.info(`[${label}] ${instructions.length} instruksi — build ${SDK_BUILD_TAG}`);
+  console.table(
+    instructions.map((ix, i) => ({
+      '#': i,
+      program: programLabel(ix),
+      akun: ix.keys.length,
+      tag: ix.data.length > 0 ? ix.data[0] : -1,
+      bytes: ix.data.byteLength,
+    }))
+  );
+};
+
+/**
+ * Penjaga layout `MintToChecked` (ix `u8 = 14`).
+ *
+ * Versi SDK lama mengirim 4 `AccountMeta` `[mint, mint, destination, authority]`
+ * (layout `TransferChecked`). Akibatnya Token-2022 membaca akun **Mint** sebagai
+ * `destination` dan transaksi gagal di preflight dengan
+ * `Error processing Instruction 8: instruction requires an initialized account`.
+ * Guard ini mengubah kegagalan simulasi yang membingungkan menjadi pesan yang jelas.
+ */
+const assertMintToCheckedLayout = (
+  instructions: TransactionInstruction[],
+  expectedDestination: PublicKey
+): void => {
+  instructions.forEach((ix, index) => {
+    if (ix.data.length === 0 || ix.data[0] !== 14) return;
+    const destination = ix.keys[1]?.pubkey;
+    if (ix.keys.length !== 3 || !destination || !destination.equals(expectedDestination)) {
+      throw new Error(
+        `Layout MintToChecked salah di instruksi #${index}: ${ix.keys.length} akun (harus 3 = [mint, destination ATA, mint_authority]). ` +
+          'Kode yang berjalan masih versi lama — jalankan "git pull" di folder proyek, restart "npm run dev", lalu hard reload browser (Ctrl+Shift+R).'
+      );
+    }
+  });
 };
 
 class SandboxBinaryConnection extends Connection {
@@ -781,6 +837,9 @@ export default function App(): React.ReactElement {
         await activeConnection.getLatestBlockhash('confirmed')
       ).blockhash;
 
+      assertMintToCheckedLayout(cloneResult.instructions, cloneResult.userTokenAta);
+      logTxLayout('clone-tx', cloneTx.instructions);
+
       await signAndDispatch(
         cloneTx,
         [cloneResult.mintKeypair],
@@ -1137,7 +1196,10 @@ export default function App(): React.ReactElement {
               <p className="font-mono text-xs text-zinc-400">
                 Native <code className="text-emerald-400">TokenInterface</code>{' '}
                 + <code className="text-cyan-300">transfer_checked</code> &bull;
-                Zero External SDKs
+                Zero External SDKs &bull; build{' '}
+                <code className="text-zinc-300" title="Stempel layout SDK terbaru">
+                  {SDK_BUILD_TAG}
+                </code>
                 {executionMode === 'DEVNET' && <> &bull; RPC {DEVNET_RPC_HOST}</>}
               </p>
             </div>
