@@ -8,6 +8,7 @@ import {
 } from '@solana/web3.js';
 import {
   ADD_LIQUIDITY_IX_LAYOUT,
+  ASSOCIATED_TOKEN_PROGRAM_ID,
   CREATE_POOL_IX_LAYOUT,
   CustomDefiSDK,
   DEFAULT_AMM_PROGRAM_ID,
@@ -28,7 +29,9 @@ import {
   calculateInitialLpTokens,
   calculateSwapOutput,
   formatTokenAmount,
+  integerSqrtBigInt,
   parseTokenAmount,
+  toU64BigInt,
 } from '../src/sdk/customSdk';
 
 class MockConnection extends Connection {
@@ -142,6 +145,22 @@ async function main(): Promise<void> {
   assert.equal(decodedCreate.initialRealTokenY, supplyRaw);
   assert.equal(decodedCreate.virtualReservesX, 30_000_000_000n);
 
+  // Transaksi pool = CreateIdempotent ATA token Y + initialize_pool
+  assert.equal(createPool.transaction.instructions.length, 2);
+  assert.equal(
+    createPool.transaction.instructions[0].programId.toBase58(),
+    ASSOCIATED_TOKEN_PROGRAM_ID.toBase58()
+  );
+  assert.equal(
+    createPool.transaction.instructions[0].keys[3].pubkey.toBase58(),
+    clone.mint.toBase58()
+  );
+  // Suplai LP awal = sqrt(virtualReservesX * initialRealTokenY)
+  assert.equal(
+    createPool.expectedInitialLp,
+    integerSqrtBigInt(DEFAULT_VIRTUAL_SOL_LAMPORTS * supplyRaw)
+  );
+
   createPool.transaction.sign(payer);
   assert.ok(createPool.transaction.serialize().byteLength <= 1232);
 
@@ -160,6 +179,10 @@ async function main(): Promise<void> {
     ADD_LIQUIDITY_IX_LAYOUT.decode(addLiq.serializedIxData).discriminator,
     1
   );
+  // 3 ATA idempotent + transfer SOL + SyncNative + add_liquidity
+  assert.equal(addLiq.transaction.instructions.length, 6);
+  addLiq.transaction.sign(payer);
+  assert.ok(addLiq.transaction.serialize().byteLength <= 1232);
 
   // 6. Uji buildSwapTx (Discriminator 2, 18B, 10 AccountMeta)
   const swapBuild = await sdk.buildSwapTx({
@@ -173,13 +196,69 @@ async function main(): Promise<void> {
   assert.equal(swapBuild.serializedIxData.byteLength, 18);
   assert.equal(swapBuild.instruction.keys.length, 10);
   assert.equal(SWAP_IX_LAYOUT.decode(swapBuild.serializedIxData).discriminator, 2);
+  // 2 ATA idempotent + transfer SOL + SyncNative + swap
+  assert.equal(swapBuild.transaction.instructions.length, 5);
+  assert.equal(
+    SWAP_IX_LAYOUT.decode(swapBuild.serializedIxData).xToY,
+    1
+  );
+  swapBuild.transaction.sign(payer);
+  assert.ok(swapBuild.transaction.serialize().byteLength <= 1232);
+
+  // Swap arah sebaliknya (Token Y -> SOL): tanpa transfer/SyncNative, tetapi
+  // diakhiri CloseAccount agar WSOL dicairkan menjadi SOL native (unwrap).
+  const sellBuild = await sdk.buildSwapTx({
+    user: payer.publicKey,
+    tokenX: NATIVE_SOL_MINT,
+    tokenY: clone.mint,
+    amountIn: 1_000_000_000n,
+    minAmountOut: 0n,
+    xToY: false,
+  });
+  assert.equal(sellBuild.transaction.instructions.length, 4);
+  assert.equal(SWAP_IX_LAYOUT.decode(sellBuild.serializedIxData).xToY, 0);
+  assert.equal(sellBuild.unwrapWsol, true);
+  const closeIx = sellBuild.transaction.instructions[3];
+  assert.equal(closeIx.programId.toBase58(), TOKEN_PROGRAM_ID.toBase58());
+  assert.deepEqual(Array.from(closeIx.data), [9]); // CloseAccount
+  assert.equal(
+    closeIx.keys[0].pubkey.toBase58(),
+    sellBuild.transaction.instructions[0].keys[1].pubkey.toBase58() // ATA WSOL
+  );
+  sellBuild.transaction.sign(payer);
+  assert.ok(sellBuild.transaction.serialize().byteLength <= 1232);
+
+  // Opsi unwrap bisa dimatikan (mis. bila pengguna ingin menyimpan WSOL)
+  const sellNoUnwrap = await sdk.buildSwapTx({
+    user: payer.publicKey,
+    tokenX: NATIVE_SOL_MINT,
+    tokenY: clone.mint,
+    amountIn: 1_000_000_000n,
+    xToY: false,
+    unwrapWsol: false,
+  });
+  assert.equal(sellNoUnwrap.transaction.instructions.length, 3);
+  assert.equal(sellNoUnwrap.unwrapWsol, false);
+
+  // unwrapWsol tidak valid untuk arah beli
+  await assert.rejects(() =>
+    sdk.buildSwapTx({
+      user: payer.publicKey,
+      tokenX: NATIVE_SOL_MINT,
+      tokenY: clone.mint,
+      amountIn: 1_000_000_000n,
+      xToY: true,
+      unwrapWsol: true,
+    })
+  );
 
   // 7. Uji fetchPoolInfo() Deserialisasi Biner 185B + Vault Token-2022
   const initialLp = calculateInitialLpTokens(DEFAULT_VIRTUAL_SOL_LAMPORTS, supplyRaw);
+  // Cadangan efektif = vault.amount + virtual_reserves, dengan virtual_reserves_y = 0.
   const swapOut5Sol = calculateSwapOutput(
     5_000_000_000n,
     DEFAULT_VIRTUAL_SOL_LAMPORTS,
-    supplyRaw + supplyRaw
+    supplyRaw
   );
 
   const poolBuf = Buffer.alloc(POOL_STATE_SIZE);
@@ -192,7 +271,7 @@ async function main(): Promise<void> {
       vaultY: createPool.addresses.vaultY,
       lpMint: createPool.addresses.lpMint,
       virtualReservesX: DEFAULT_VIRTUAL_SOL_LAMPORTS,
-      virtualReservesY: supplyRaw,
+      virtualReservesY: 0n,
       bump: createPool.addresses.poolBump,
     },
     poolBuf
@@ -284,7 +363,24 @@ async function main(): Promise<void> {
   assert.equal(unpacked.realReservesX, 5_000_000_000n);
   assert.equal(unpacked.virtualReservesX, 30_000_000_000n);
   assert.equal(unpacked.totalReservesX, 35_000_000_000n);
+  assert.equal(unpacked.virtualReservesY, 0n);
+  assert.equal(unpacked.totalReservesY, supplyRaw - swapOut5Sol);
   assert.equal(unpacked.lpSupply, initialLp);
+
+  // 8. Uji batas/edge-case matematika & parser (anti-regresi)
+  assert.equal(integerSqrtBigInt(0n), 0n);
+  assert.equal(integerSqrtBigInt(1n), 1n);
+  assert.equal(integerSqrtBigInt(1_000_000_000_000_000_000n), 1_000_000_000n);
+  assert.equal(toU64BigInt(42), 42n);
+  assert.throws(() => toU64BigInt(-1));
+  assert.throws(() => toU64BigInt(1.5));
+  assert.throws(() => parseTokenAmount('1.1234567890', 9));
+  assert.throws(() => parseTokenAmount('abc'));
+  assert.throws(() => calculateSwapOutput(0n, 1n, 1n));
+  assert.throws(() => calculateSwapOutput(1n, 0n, 1n));
+  assert.throws(() => calculateInitialLpTokens(0n, 1n));
+  assert.equal(formatTokenAmount(1_500_000_000n, 9, 2), '1.5');
+  assert.equal(parseTokenAmount('1,000.5', 9), 1_000_500_000_000n);
 
   console.log('ALL TOKEN-2022 & VIRTUAL LIQUIDITY AMM BINARY TESTS PASSED!');
   console.log({

@@ -2,7 +2,6 @@
 anchor_version = "0.31.1"
 
 [features]
-resolution = true
 skip-lint = false
 
 [programs.localnet]
@@ -17,3 +16,6 @@ url = "https://api.apr.dev"
 [provider]
 cluster = "devnet"
 wallet = "~/.config/solana/id.json"
+
+[scripts]
+test = "npm test"

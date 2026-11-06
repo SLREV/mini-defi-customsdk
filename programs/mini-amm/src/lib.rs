@@ -50,9 +50,15 @@ pub mod mini_amm {
         pool.vault_y = ctx.accounts.vault_y.key();
         pool.lp_mint = ctx.accounts.lp_mint.key();
 
-        // Set konfigurasi Virtual Curve di detik ke-0
+        // Set konfigurasi Virtual Curve di detik ke-0.
+        //
+        // CATATAN PENTING: cadangan efektif kurva = `vault.amount + virtual_reserves`.
+        // Kreator menyetor 100% suplai token fisik ke `vault_y`, sehingga `vault_y.amount`
+        // SUDAH merupakan seluruh cadangan token Y. Karena itu `virtual_reserves_y` harus 0
+        // pada inisialisasi — jika diisi `initial_real_token_y` maka token Y akan terhitung
+        // dua kali (harga awal & suplai LP menjadi tidak konsisten terhadap invariant k).
         pool.virtual_reserves_x = virtual_reserves_x;
-        pool.virtual_reserves_y = initial_real_token_y;
+        pool.virtual_reserves_y = 0;
         pool.bump = bump;
 
         // Transfer 100% token proyek fisik dari pembuat ke Vault AMM menggunakan transfer_checked (Aman untuk Token-2022)
@@ -425,7 +431,7 @@ pub struct PoolState {
     pub vault_y: Pubkey,          // 32B (104..136) Vault penampung Token Y riil
     pub lp_mint: Pubkey,          // 32B (136..168) Mint LP Token
     pub virtual_reserves_x: u64,  // 8B  (168..176) Likuiditas bayangan X (misal: 30 SOL)
-    pub virtual_reserves_y: u64,  // 8B  (176..184) Likuiditas bayangan Y awal
+    pub virtual_reserves_y: u64,  // 8B  (176..184) Likuiditas bayangan Y (0 pada inisialisasi)
     pub bump: u8,                 // 1B  (184..185) Canonical PDA bump
 }
 
@@ -542,14 +548,20 @@ pub struct AddLiquidity<'info> {
     )]
     pub lp_mint: Box<InterfaceAccount<'info, Mint>>,
 
+    // `token::*` constraint tidak mendukung custom error (`@ AmmError::..`),
+    // jadi hanya constraint polos yang dipakai di sini.
     #[account(
         mut,
+        token::mint = token_x,
+        token::authority = pool_state,
         token::token_program = token_program_x,
     )]
     pub vault_x: Box<InterfaceAccount<'info, TokenAccount>>,
 
     #[account(
         mut,
+        token::mint = token_y,
+        token::authority = pool_state,
         token::token_program = token_program_y,
     )]
     pub vault_y: Box<InterfaceAccount<'info, TokenAccount>>,
@@ -608,14 +620,20 @@ pub struct Swap<'info> {
     )]
     pub pool_state: Box<Account<'info, PoolState>>,
 
+    // `token::*` constraint tidak mendukung custom error (`@ AmmError::..`),
+    // jadi hanya constraint polos yang dipakai di sini.
     #[account(
         mut,
+        token::mint = token_x,
+        token::authority = pool_state,
         token::token_program = token_program_x,
     )]
     pub vault_x: Box<InterfaceAccount<'info, TokenAccount>>,
 
     #[account(
         mut,
+        token::mint = token_y,
+        token::authority = pool_state,
         token::token_program = token_program_y,
     )]
     pub vault_y: Box<InterfaceAccount<'info, TokenAccount>>,

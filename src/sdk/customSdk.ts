@@ -88,6 +88,7 @@ export const AMM_IX_DISCRIMINATOR = {
 
 const SPL_TOKEN_IX = {
   INITIALIZE_MINT: 0,
+  CLOSE_ACCOUNT: 9,
   MINT_TO_CHECKED: 14,
   SYNC_NATIVE: 17,
   INITIALIZE_MINT2: 20,
@@ -467,6 +468,11 @@ export interface SwapParams {
   xToY: boolean;
   tokenProgramX?: PublicKey;
   tokenProgramY?: PublicKey;
+  /**
+   * Hanya untuk swap Y -> X ketika Token X adalah WSOL. Default `true`: ATA WSOL ditutup
+   * (`CloseAccount`) setelah swap sehingga pengguna menerima **SOL native**, bukan WSOL.
+   */
+  unwrapWsol?: boolean;
   recentBlockhash?: string;
 }
 
@@ -475,6 +481,8 @@ export interface SwapBuildResult {
   instruction: TransactionInstruction;
   serializedIxData: Buffer;
   addresses: DerivedPoolAddresses;
+  /** `true` bila transaksi diakhiri `CloseAccount` untuk mencairkan WSOL menjadi SOL native */
+  unwrapWsol: boolean;
 }
 
 export interface DeserializedPoolInfo {
@@ -528,7 +536,14 @@ export function parseTokenAmount(
   decimals = DEFAULT_TOKEN_DECIMALS
 ): bigint {
   if (typeof amount === 'bigint') {
-    return amount * 10n ** BigInt(decimals);
+    if (amount < 0n) {
+      throw new RangeError(`Nilai token tidak boleh negatif: ${amount.toString()}`);
+    }
+    const raw = amount * 10n ** BigInt(decimals);
+    if (raw > MAX_U64) {
+      throw new RangeError(`Nilai raw (${raw.toString()}) melebihi batas u64 Solana`);
+    }
+    return raw;
   }
   const normalized = String(amount).trim().replace(/,/g, '');
   if (!/^\d+(\.\d+)?$/.test(normalized)) {
@@ -616,6 +631,13 @@ export function calculateSwapOutput(
   const numerator = amountInWithFee * reserveOut;
   const denominator = reserveIn * 1000n + amountInWithFee;
   const out = numerator / denominator;
+  // Paritas 1:1 dengan `calculate_swap_output` di `programs/mini-amm/src/lib.rs`
+  if (out <= 0n) {
+    throw new Error('Computed swap output amount is zero');
+  }
+  if (out >= reserveOut) {
+    throw new Error('Computed swap output exhausts the output reserve');
+  }
   if (out > MAX_U64) {
     throw new RangeError('Swap output exceeds u64 bounds');
   }
@@ -949,6 +971,30 @@ export class CustomDefiSDK {
     });
   }
 
+  /**
+   * SPL Token / Token-2022 `CloseAccount` (ix 9, 1 byte).
+   * Dipakai untuk mencairkan seluruh saldo WSOL di ATA menjadi SOL native di `destination`.
+   */
+  public buildCloseAccountInstruction(
+    account: PublicKey,
+    destination: PublicKey,
+    owner: PublicKey,
+    tokenProgramId: PublicKey = TOKEN_PROGRAM_ID
+  ): TransactionInstruction {
+    const data = Buffer.alloc(SINGLE_U8_IX_LAYOUT.span);
+    SINGLE_U8_IX_LAYOUT.encode({ instruction: SPL_TOKEN_IX.CLOSE_ACCOUNT }, data);
+
+    return new TransactionInstruction({
+      programId: tokenProgramId,
+      keys: [
+        { pubkey: account, isSigner: false, isWritable: true },
+        { pubkey: destination, isSigner: false, isWritable: true },
+        { pubkey: owner, isSigner: true, isWritable: false },
+      ],
+      data,
+    });
+  }
+
   public buildLegacyMetaplexMetadataV3Instruction(params: {
     metadataPda: PublicKey;
     mint: PublicKey;
@@ -1219,6 +1265,13 @@ export class CustomDefiSDK {
   /**
    * Serialisasi `initialize_pool` (`u8` discriminator = 0 + `initialRealTokenY` + `virtualReservesX`)
    * dan menyusun 15 `AccountMeta` lintas-program (`tokenProgramX`, `tokenProgramY`, `tokenProgramLp`).
+   *
+   * Transaksi yang dihasilkan berisi 2 instruksi:
+   * 1. `CreateIdempotent` ATA `userTokenY` — account ini WAJIB sudah ada karena
+   *    `InitializePool<'info>` mendeklarasikannya sebagai `token::authority = payer`
+   *    (bukan `init_if_needed`), sehingga tanpa instruksi ini `initialize_pool` gagal
+   *    dengan `AccountNotInitialized` bila pengguna belum punya ATA token Y.
+   * 2. `initialize_pool` (17 byte payload, disc = 0).
    */
   public async buildCreatePoolTx(
     params: CreatePoolParams
@@ -1289,12 +1342,24 @@ export class CustomDefiSDK {
       data: serializedIxData,
     });
 
-    const transaction = new Transaction().add(instruction);
+    const transaction = new Transaction().add(
+      // ATA token Y milik pembuat pool harus ada sebelum CPI `transfer_checked`.
+      this.buildCreateAssociatedTokenIdempotentInstruction(
+        params.payer,
+        userTokenY,
+        params.payer,
+        tokenY,
+        tokenProgramY
+      ),
+      instruction
+    );
     transaction.feePayer = params.payer;
     transaction.recentBlockhash =
       params.recentBlockhash ??
       (await this.connection.getLatestBlockhash('confirmed')).blockhash;
 
+    // Kurva efektif = `vault.amount + virtual_reserves`; karena `virtual_reserves_y = 0`
+    // (lihat `initialize_pool`), suplai LP awal = sqrt(virtualReservesX * initialRealTokenY).
     const expectedInitialLp = calculateInitialLpTokens(
       virtualReservesX,
       initialRealTokenY
@@ -1527,6 +1592,29 @@ export class CustomDefiSDK {
     });
 
     transaction.add(instruction);
+
+    // Jual Token Y -> WSOL: tutup ATA WSOL agar pengguna menerima SOL native (unwrap).
+    const unwrapWsol =
+      params.unwrapWsol ?? (!params.xToY && tokenX.equals(NATIVE_SOL_MINT));
+    if (unwrapWsol) {
+      if (params.xToY) {
+        throw new Error(
+          'unwrapWsol hanya berlaku untuk swap Y -> X (menjual token ke WSOL)'
+        );
+      }
+      if (!tokenX.equals(NATIVE_SOL_MINT)) {
+        throw new Error('unwrapWsol hanya berlaku bila Token X adalah WSOL');
+      }
+      transaction.add(
+        this.buildCloseAccountInstruction(
+          userTokenX,
+          params.user,
+          params.user,
+          tokenProgramX
+        )
+      );
+    }
+
     transaction.feePayer = params.user;
     transaction.recentBlockhash =
       params.recentBlockhash ??
@@ -1537,6 +1625,7 @@ export class CustomDefiSDK {
       instruction,
       serializedIxData,
       addresses,
+      unwrapWsol,
     };
   }
 
