@@ -375,6 +375,11 @@ Selain itu dashboard mencetak ringkasan layout transaksi ke console (`console.ta
 | Gejala | Penyebab & solusi |
 | :--- | :--- |
 | `feature \`edition2024\` is required` saat `anchor build` | Cargo bawaan toolchain SBF masih 1.84. Lihat bagian **Gagal `anchor build`: feature `edition2024`** di bawah. |
+| `unknown variant \`3\`, expected \`1\` or \`2\`` | `resolver = "3"` di `Cargo.toml` — ditolak Anchor 0.31.1. Pakai `resolver = "2"` dan aktifkan MSRV-aware lewat `.cargo/config.toml`. |
+| `cargo-build-sbf` masih melaporkan rustc 1.84 setelah install Agave baru | Binary lama menang di `PATH`. Cek `which -a cargo-build-sbf`, pastikan `~/.local/share/solana/install/active_release/bin` ada di depan. |
+| `Downloading platform-tools v1.57 ... (506 MiB)` | Normal, sekali saja. `cargo-build-sbf` versi baru mengunduh toolchain SBF pertama kali dipakai. Jangan dihentikan. |
+| `warning: This cargo-build-sbf was installed with the Solana CLI` | Tidak berbahaya — itu `cargo-build-sbf` baru yang menyadari ada binary lain di `~/.cargo/bin`. Lihat catatan `PATH` di bagian edition2024. |
+| `agave-install list` gagal: `missing field json_rpc_url` | File `~/.config/solana/install/config.yml` rusak/terpotong. Anchor mengabaikannya dan melanjutkan; kalau mengganggu, hapus file itu (hanya menyimpan URL rilis). |
 | `info: uninstalling toolchain solana` lalu `toolchain solana uninstalled` | Normal — itu `cargo-build-sbf` yang me-*relink* toolchain rustup `solana` ke platform-tools bawaannya setiap build. Solana CLI Anda tidak dihapus. |
 | `anchor deploy` → `Unable to open program file: target/deploy/mini_amm.so` | Build-nya belum pernah sukses, jadi `.so` tidak ada. Deploy **tidak** membangun apa pun. Perbaiki `anchor build` dulu, baru deploy. |
 | `Attempt to load a program that does not exist` | Program belum ter-deploy di devnet / program ID tidak sama dengan `declare_id!`. Jalankan `anchor keys sync` lalu `anchor deploy --provider.cluster devnet`. |
@@ -426,11 +431,33 @@ Masalah muncul belakangan tanpa Anda mengubah kode: crate transitif seperti
    hanya butuh Cargo >= 1.80 untuk membaca manifest program, jadi kombinasi ini tidak konflik.
 
 ```bash
-sh -c "$(curl -sSfL https://release.anza.xyz/v4.4.1/install)"   # Agave 4.4.1
-anchor clean                                                     # buang cache build lama
-cargo-build-sbf --version                                        # harus rustc >= 1.85
-npm run toolchain:check                                          # status + saran otomatis
+# 1. Install Agave baru
+sh -c "$(curl -sSfL https://release.anza.xyz/v4.4.1/install)"
+
+# 2. PASTIKAN shell memakai binary yang baru (paling sering terlewat)
+export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"
+which -a cargo-build-sbf        # hanya boleh satu, di path di atas
+cargo-build-sbf --version       # unduh platform-tools v1.57 (~500 MB) di run pertama
+
+# 3. Bersihkan cache build lama lalu cek
+anchor clean
+npm run toolchain:check
+
+# 4. Build & deploy
 anchor build
+ls -la target/deploy/mini_amm.so
+anchor deploy --provider.cluster devnet
+```
+
+Pada pemakaian pertama, `cargo-build-sbf` akan menampilkan
+`Downloading platform-tools v1.57` sekitar 500 MB. Itu normal dan hanya sekali — biarkan
+selesai. Setelah itu `cargo-build-sbf --version` harus melaporkan **rustc 1.95**.
+
+Kalau masih melaporkan 1.84, ada instalasi Solana lain yang menang di `PATH`:
+
+```bash
+which -a cargo-build-sbf
+# buang yang lama (mis. ~/.cargo/bin atau /usr/local/bin) dari PATH
 ```
 
 `Anchor.toml` sudah mematok `solana_version = "4.4.1"` di `[toolchain]`, sehingga
@@ -439,9 +466,22 @@ lalu mengembalikan versi aktif setelah selesai.
 
 **2. Cadangan bila toolchain belum bisa di-upgrade: paksa versi crate lama.**
 
-Repo ini sudah menyiapkan dua lapis: `resolver = "3"` di `Cargo.toml` (resolver MSRV-aware)
-dan `.cargo/config.toml` berisi `incompatible-rust-versions = "fallback"`. Cargo lalu memilih
-versi dependency terbaru yang masih cocok, bukan yang terbaru mutlak.
+Repo ini mengaktifkan resolver MSRV-aware lewat **`.cargo/config.toml`**
+(`[resolver] incompatible-rust-versions = "fallback"`) sehingga Cargo memilih versi dependency
+terbaru yang masih cocok, bukan versi terbaru mutlak.
+
+> ⚠️ **Jangan** memakai `resolver = "3"` di `Cargo.toml`. Anchor 0.31.1 mem-parse manifest
+> dengan `cargo_toml 0.19` yang enum `Resolver`-nya hanya `V1`/`V2`, sehingga `anchor build`
+> dan `anchor deploy` mati sebelum build:
+>
+> ```
+> Error reading manifest from path: .../Cargo.toml
+> TOML parse error at line N: unknown variant `3`, expected `1` or `2`
+> ```
+>
+> Karena itu `Cargo.toml` memakai `resolver = "2"` (aman untuk Anchor), sedangkan perilaku
+> MSRV-aware diatur dari `.cargo/config.toml` yang hanya dibaca Cargo asli.
+> `npm run toolchain:check` akan menandai `resolver = "3"` sebagai **MANIFEST DITOLAK ANCHOR**.
 
 Kalau masih ada crate yang **semua** versinya edition 2024 (mis. `blake3 1.8.3` yang tidak
 mendeklarasikan `rust-version`), patok manual:

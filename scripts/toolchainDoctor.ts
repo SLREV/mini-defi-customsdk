@@ -61,7 +61,12 @@ export function formatVersion(v: Version | null): string {
   return v ? `${v.major}.${v.minor}.${v.patch}` : 'tidak terbaca';
 }
 
-export type ToolchainVerdict = 'ok' | 'edition2024-blocked' | 'missing-binary' | 'unknown';
+export type ToolchainVerdict =
+  | 'ok'
+  | 'edition2024-blocked'
+  | 'anchor-manifest-incompatible'
+  | 'missing-binary'
+  | 'unknown';
 
 export interface ToolchainReport {
   verdict: ToolchainVerdict;
@@ -71,6 +76,8 @@ export interface ToolchainReport {
   anchorSolanaVersion: string | null;
   resolver: string | null;
   msrvAwareResolver: boolean;
+  /** true bila Cargo.toml memakai resolver yang ditolak Anchor 0.31.1 (`3`). */
+  anchorManifestIncompatible: boolean;
   binary: string | null;
   hints: string[];
 }
@@ -137,8 +144,11 @@ export function inspectToolchain(root = process.cwd()): ToolchainReport {
   const cargoConfig = existsSync(configPath)
     ? readFileSync(configPath, 'utf8')
     : '';
+  // Anchor 0.31.1 mem-parse Cargo.toml lewat cargo_toml 0.19, yang enum
+  // Resolver-nya hanya V1/V2. `resolver = "3"` membuat anchor build/deploy mati
+  // dengan "unknown variant `3`, expected `1` or `2`" sebelum menyentuh kode.
+  const anchorManifestIncompatible = resolver !== null && !['1', '2'].includes(resolver);
   const msrvAwareResolver =
-    resolver === '3' ||
     /incompatible-rust-versions\s*=\s*"fallback"/.test(cargoConfig);
 
   const raw = run('cargo-build-sbf', ['--version']);
@@ -186,6 +196,19 @@ export function inspectToolchain(root = process.cwd()): ToolchainReport {
     hints.push(`Toolchain SBF memakai rustc ${formatVersion(rustc)} (edition 2024 didukung).`);
   }
 
+  if (anchorManifestIncompatible) {
+    verdict = 'anchor-manifest-incompatible';
+    hints.push(
+      `Cargo.toml memakai resolver = "${resolver}" yang DITOLAK Anchor 0.31.1 ` +
+        '(cargo_toml 0.19 hanya mengenal "1"/"2"): ' +
+        '`unknown variant, expected 1 or 2` saat anchor build/deploy.'
+    );
+    hints.push(
+      'Ganti ke resolver = "2"; aktifkan resolver MSRV-aware lewat .cargo/config.toml ' +
+        '(`[resolver] incompatible-rust-versions = "fallback"`).'
+    );
+  }
+
   if (!solanaVersionSupportsEdition2024(anchorSolanaVersion)) {
     hints.push(
       'Anchor.toml belum mematok `solana_version` >= 4.0.0 di [toolchain]; tanpa itu ' +
@@ -209,6 +232,7 @@ export function inspectToolchain(root = process.cwd()): ToolchainReport {
     anchorSolanaVersion,
     resolver,
     msrvAwareResolver,
+    anchorManifestIncompatible,
     binary,
     hints,
   };
@@ -226,6 +250,7 @@ function main(): void {
   const label: Record<ToolchainVerdict, string> = {
     ok: '\u2714 OK',
     'edition2024-blocked': '\u2716 TERBLOKIR edition2024',
+    'anchor-manifest-incompatible': '\u2716 MANIFEST DITOLAK ANCHOR',
     'missing-binary': '\u26a0 cargo-build-sbf tidak ada',
     unknown: '\u26a0 versi tidak terbaca',
   };
