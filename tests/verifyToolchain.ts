@@ -250,16 +250,45 @@ for (const id of anchorTomlIds) {
     `Anchor.toml (${id}) harus sama dengan declare_id! (${repoDeclareId})`
   );
 }
+// Keberadaan target/deploy bergantung pada mesin yang menjalankan tes: bersih
+// setelah clone, ada setelah `anchor build`. Dulu bagian ini mematok
+// `deployKeypairPubkey === null`, sehingga `npm test` gagal di mesin yang sudah
+// pernah build (keypair memang ada). Yang benar adalah menguji HUBUNGAN:
+//   - keypair boleh ada atau tidak, tapi kalau ada ia harus pubkey base58 valid
+//   - programIdMismatch harus konsisten dengan nilai keypair tersebut
+//   - keypair TIDAK boleh menunjuk program ID lain (itu kesalahan konfigurasi
+//     nyata: deploy akan mendarat di alamat berbeda dari declare_id!)
+//   - declare_id! TIDAK boleh dianggap basi (semua sumber sudah sepakat)
+// Deteksi mismatch itu sendiri sudah diuji di fixture sintetis bagian 7.
 const repoReport = inspectToolchain(REPO);
+if (repoReport.deployKeypairPubkey !== null) {
+  assert.match(
+    repoReport.deployKeypairPubkey,
+    /^[1-9A-HJ-NP-Za-km-z]{32,44}$/,
+    'pubkey keypair deploy harus base58 valid'
+  );
+}
 assert.equal(
-  repoReport.deployKeypairPubkey,
-  null,
-  'repo tanpa target/deploy tidak boleh melaporkan keypair'
+  repoReport.programIdMismatch,
+  repoReport.deployKeypairPubkey !== null &&
+    repoReport.deployKeypairPubkey !==
+      (repoReport.envAmmProgramId ?? repoReport.sdkProgramId ?? repoReport.declareId),
+  'programIdMismatch harus konsisten dengan ada/tidaknya keypair'
 );
+// Keypair hasil `anchor build` HARUS menunjuk program ID yang sama dengan
+// declare_id!. Kalau tidak, `anchor deploy` akan mendarat di alamat lain dan
+// dashboard memanggil alamat yang salah. Ini kesalahan konfigurasi nyata, bukan
+// perbedaan antar-mesin, jadi harus gagal keras.
 assert.equal(
   repoReport.programIdMismatch,
   false,
-  'tanpa target/deploy tidak boleh ada mismatch palsu'
+  'keypair di target/deploy menunjuk program ID berbeda dari declare_id! — ' +
+    'jalankan `anchor keys sync` lalu build ulang'
+);
+assert.equal(
+  repoReport.declareIdStale,
+  false,
+  'declare_id! di repo harus sama dengan program ID yang dipakai dashboard'
 );
 
 // 10. Bundle `dist/` basi: kalau masih memuat program ID lama, `npm run preview`
