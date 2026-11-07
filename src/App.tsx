@@ -1,4 +1,5 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { formatExactTokenAmount, readSwapTokenBalance } from './tradeUtils';
 import {
   AccountInfo,
   Commitment,
@@ -335,7 +336,15 @@ export default function App(): React.ReactElement {
   ]);
 
   const [poolInfo, setPoolInfo] = useState<DeserializedPoolInfo | null>(null);
-  const [userTokenBalanceRaw, setUserTokenBalanceRaw] = useState<bigint>(0n);
+  const [sandboxTokenBalanceRaw, setSandboxTokenBalanceRaw] = useState<bigint>(0n);
+  const [sandboxOwner, setSandboxOwner] = useState<string | null>(null);
+  const [poolMode, setPoolMode] = useState<'SANDBOX' | 'DEVNET' | null>(null);
+  const [devnetBalance, setDevnetBalance] = useState<{ key: string; amount: bigint } | null>(null);
+  const [balanceError, setBalanceError] = useState<string | null>(null);
+  const [balanceBusy, setBalanceBusy] = useState(false);
+  const [balanceRevision, setBalanceRevision] = useState(0);
+  const [copyStatus, setCopyStatus] = useState('');
+  const balanceRequest = useRef(0);
   const [telemetry, setTelemetry] = useState<BinaryTelemetry | null>(null);
 
   // Status devnet: saldo SOL wallet & proses airdrop
@@ -351,6 +360,83 @@ export default function App(): React.ReactElement {
     () => new Connection(DEVNET_RPC_ENDPOINT, 'confirmed'),
     []
   );
+
+  const activeOwner = walletPubkey ?? ephemeralKeypair.publicKey;
+  const balanceKey = poolInfo
+    ? `${executionMode}:${activeOwner.toBase58()}:${poolInfo.tokenY.toBase58()}:${poolInfo.tokenProgramY.toBase58()}`
+    : '';
+  const currentBalanceKey = useRef(balanceKey);
+  currentBalanceKey.current = balanceKey;
+  const userTokenBalanceRaw = poolMode !== executionMode ? null
+    : executionMode === 'SANDBOX'
+      ? (sandboxOwner === activeOwner.toBase58() ? sandboxTokenBalanceRaw : 0n)
+      : (devnetBalance?.key === balanceKey ? devnetBalance.amount : null);
+
+  // Refresh the on-chain ATA after launch, swap, claim, or wallet/mode changes.
+  useEffect(() => {
+    const request = ++balanceRequest.current;
+    if (!poolInfo || executionMode !== 'DEVNET' || poolMode !== 'DEVNET') {
+      setBalanceBusy(false);
+      setBalanceError(null);
+      return;
+    }
+    let cancelled = false;
+    setDevnetBalance(null);
+    setBalanceError(null);
+    setBalanceBusy(true);
+    void readSwapTokenBalance(devnetConnection, activeOwner, poolInfo.tokenY, poolInfo.tokenProgramY)
+      .then((amount) => {
+        if (!cancelled && request === balanceRequest.current) setDevnetBalance({ key: balanceKey, amount });
+      })
+      .catch((err: unknown) => {
+        if (!cancelled && request === balanceRequest.current) {
+          setBalanceError(err instanceof Error ? err.message : 'Gagal membaca saldo token');
+        }
+      })
+      .finally(() => {
+        if (!cancelled && request === balanceRequest.current) setBalanceBusy(false);
+      });
+    return () => { cancelled = true; };
+  // Key includes the owner, mint and token program; reserves updates do not require a read.
+  }, [balanceKey, balanceRevision, devnetConnection, poolMode]);
+
+  const handleSellAll = async (): Promise<void> => {
+    if (!poolInfo || poolMode !== executionMode) return;
+    setTradeSide('SELL');
+    setTradeAmountInput('');
+    setErrorMessage(null);
+    if (executionMode === 'SANDBOX') {
+      setTradeAmountInput(formatExactTokenAmount(userTokenBalanceRaw ?? 0n));
+      return;
+    }
+    const key = balanceKey;
+    const request = ++balanceRequest.current;
+    setBalanceBusy(true);
+    setBalanceError(null);
+    setDevnetBalance(null);
+    try {
+      const amount = await readSwapTokenBalance(devnetConnection, activeOwner, poolInfo.tokenY, poolInfo.tokenProgramY);
+      if (request !== balanceRequest.current || key !== currentBalanceKey.current) return;
+      setDevnetBalance({ key, amount });
+      setTradeAmountInput(formatExactTokenAmount(amount));
+    } catch (err) {
+      if (request === balanceRequest.current && key === currentBalanceKey.current) {
+        setBalanceError(err instanceof Error ? err.message : 'Gagal membaca saldo token');
+      }
+    } finally {
+      if (request === balanceRequest.current && key === currentBalanceKey.current) setBalanceBusy(false);
+    }
+  };
+
+  const handleCopyMint = async (): Promise<void> => {
+    if (!poolInfo) return;
+    try {
+      await navigator.clipboard.writeText(poolInfo.tokenY.toBase58());
+      setCopyStatus('Mint disalin');
+    } catch {
+      setCopyStatus('Gagal menyalin. Pilih dan salin alamat secara manual.');
+    }
+  };
 
   const readSolBalance = async (
     conn: Connection,
@@ -801,7 +887,10 @@ export default function App(): React.ReactElement {
     }
 
     setPoolInfo(null);
-    setUserTokenBalanceRaw(0n);
+    setPoolMode(null);
+    setCopyStatus('');
+    setSandboxOwner(activePayer.toBase58());
+    setSandboxTokenBalanceRaw(0n);
     setTelemetry(null);
     setSteps([
       {
@@ -1015,9 +1104,8 @@ export default function App(): React.ReactElement {
 
         realX += firstBuySolRaw;
         realY -= expectedOut;
-        setUserTokenBalanceRaw(expectedOut);
-
         if (executionMode === 'SANDBOX') {
+          setSandboxTokenBalanceRaw(expectedOut);
           commitSandboxState({
             poolAddress: createPoolResult.addresses.poolState,
             tokenX: NATIVE_SOL_MINT,
@@ -1077,6 +1165,7 @@ export default function App(): React.ReactElement {
         cloneIxCount: cloneResult.instructions.length,
       });
 
+      setPoolMode(executionMode);
       setPoolInfo(unpacked);
       updateStep(4, {
         status: 'done',
@@ -1139,7 +1228,7 @@ export default function App(): React.ReactElement {
   }, [poolInfo, tradeAmountInput, tradeSide]);
 
   const handleExecuteSwap = async (): Promise<void> => {
-    if (!poolInfo || !swapQuote) return;
+    if (!poolInfo || !swapQuote || poolMode !== executionMode) return;
     setErrorMessage(null);
 
     const activeUser = walletPubkey ?? ephemeralKeypair.publicKey;
@@ -1147,18 +1236,20 @@ export default function App(): React.ReactElement {
       executionMode === 'SANDBOX' ? sandboxConnection : devnetConnection;
     const sdk = new CustomDefiSDK(activeConnection, DEFAULT_AMM_PROGRAM_ID);
 
+    setStage('SWAPPING');
     try {
-      if (
-        tradeSide === 'SELL' &&
-        executionMode === 'SANDBOX' &&
-        swapQuote.amountInRaw > userTokenBalanceRaw
-      ) {
-        throw new Error(
-          `Saldo ${ticker.toUpperCase()} Anda (${formatTokenAmount(userTokenBalanceRaw, 9, 2)}) tidak mencukupi`
-        );
+      if (executionMode === 'SANDBOX' && sandboxOwner !== activeUser.toBase58()) {
+        throw new Error('Pool sandbox hanya mendukung wallet yang membuat pool');
+      }
+      if (tradeSide === 'SELL') {
+        const balance = executionMode === 'DEVNET'
+          ? await readSwapTokenBalance(devnetConnection, activeUser, poolInfo.tokenY, poolInfo.tokenProgramY)
+          : userTokenBalanceRaw;
+        if (balance === null || swapQuote.amountInRaw > balance) {
+          throw new Error(`Saldo ${ticker.toUpperCase()} tidak mencukupi atau belum tersedia`);
+        }
       }
 
-      setStage('SWAPPING');
       const isBuy = tradeSide === 'BUY';
       setStatusBanner(
         isBuy
@@ -1228,11 +1319,12 @@ export default function App(): React.ReactElement {
           bump: poolInfo.bump,
         });
 
-        setUserTokenBalanceRaw((prev) =>
+        setSandboxTokenBalanceRaw((prev) =>
           isBuy ? prev + swapQuote.amountOut : prev - swapQuote.amountInRaw
         );
       }
 
+      setBalanceRevision((value) => value + 1);
       const refreshed = await sdk.fetchPoolInfo(poolInfo.poolAddress);
       setPoolInfo(refreshed);
       setTelemetry((prev) =>
@@ -1262,7 +1354,7 @@ export default function App(): React.ReactElement {
    * fee vault dikosongkan pada ledger lokal agar alur UI-nya tetap teruji.
    */
   const handleClaimCreatorFee = async (): Promise<void> => {
-    if (!poolInfo) return;
+    if (!poolInfo || poolMode !== executionMode) return;
     const activeUser = walletPubkey ?? ephemeralKeypair.publicKey;
     const activeConnection =
       executionMode === 'SANDBOX' ? sandboxConnection : devnetConnection;
@@ -1288,6 +1380,7 @@ export default function App(): React.ReactElement {
       setStatusBanner('Mengklaim fee creator (claim_creator_fee, disc 3)...');
 
       if (executionMode === 'SANDBOX') {
+        setSandboxTokenBalanceRaw((prev) => prev + poolInfo.creatorFeeY);
         commitSandboxState({
           poolAddress: poolInfo.poolAddress,
           tokenX: poolInfo.tokenX,
@@ -1317,6 +1410,7 @@ export default function App(): React.ReactElement {
         await signAndDispatch(claim.transaction, [], activeConnection);
       }
 
+      setBalanceRevision((value) => value + 1);
       const refreshed = await sdk.fetchPoolInfo(poolInfo.poolAddress);
       setPoolInfo(refreshed);
       setStatusBanner(
@@ -1806,7 +1900,7 @@ export default function App(): React.ReactElement {
                     </h3>
                     <p className="font-mono text-[11px] text-zinc-400">
                       Saldo Dompet Anda:{' '}
-                      {formatTokenAmount(userTokenBalanceRaw, 9, 2)}{' '}
+                      {userTokenBalanceRaw === null ? '—' : formatExactTokenAmount(userTokenBalanceRaw)}{' '}
                       {ticker.toUpperCase()} &bull; LP Supply:{' '}
                       {formatTokenAmount(poolInfo.lpSupply, 9, 2)}
                     </p>
@@ -1851,11 +1945,18 @@ export default function App(): React.ReactElement {
                       {poolInfo.tokenX.toBase58()}
                     </span>
                   </div>
-                  <div className="flex justify-between gap-2">
-                    <span className="text-zinc-500">token_y (Token-2022 Mint):</span>
-                    <span className="truncate text-emerald-300">
-                      {poolInfo.tokenY.toBase58()}
-                    </span>
+                  <div className="mt-2">
+                    <label htmlFor="token-mint-address" className="text-zinc-500">Mint token (token_y):</label>
+                    <div className="mt-1 flex gap-2">
+                      <input id="token-mint-address" readOnly value={poolInfo.tokenY.toBase58()}
+                        onFocus={(e) => e.currentTarget.select()}
+                        className="min-w-0 flex-1 rounded border border-zinc-700 bg-zinc-900 px-2 py-1 text-emerald-300" />
+                      <button type="button" onClick={() => void handleCopyMint()}
+                        className="rounded border border-emerald-500/50 px-2 py-1 text-emerald-300 hover:bg-emerald-500/15">
+                        Copy Mint
+                      </button>
+                    </div>
+                    <p role="status" className="mt-1 text-zinc-400">{copyStatus}</p>
                   </div>
                   <div className="flex justify-between gap-2">
                     <span className="text-zinc-500">token_program_y:</span>
@@ -1908,7 +2009,7 @@ export default function App(): React.ReactElement {
                       type="button"
                       onClick={() => void handleClaimCreatorFee()}
                       disabled={
-                        claimBusy ||
+                        claimBusy || isBusy || poolMode !== executionMode ||
                         !poolInfo ||
                         (poolInfo.creatorFeeX === 0n && poolInfo.creatorFeeY === 0n)
                       }
@@ -1955,6 +2056,7 @@ export default function App(): React.ReactElement {
                   <div className="inline-flex rounded-lg border border-zinc-800 bg-zinc-950 p-0.5 text-xs">
                     <button
                       type="button"
+                      disabled={balanceBusy || isBusy}
                       onClick={() => {
                         setTradeSide('BUY');
                         setTradeAmountInput('5');
@@ -1969,6 +2071,7 @@ export default function App(): React.ReactElement {
                     </button>
                     <button
                       type="button"
+                      disabled={balanceBusy || isBusy}
                       onClick={() => {
                         setTradeSide('SELL');
                         setTradeAmountInput('10000000');
@@ -1990,8 +2093,16 @@ export default function App(): React.ReactElement {
                       Jumlah Input (
                       {tradeSide === 'BUY' ? 'SOL' : ticker.toUpperCase()})
                     </label>
+                    <div className="mb-1 flex justify-end">
+                      <button type="button" onClick={() => void handleSellAll()}
+                        disabled={isBusy || claimBusy || balanceBusy || poolMode !== executionMode}
+                        className="rounded border border-rose-500/50 px-2 py-1 text-xs font-semibold text-rose-300 hover:bg-rose-500/15 disabled:opacity-50">
+                        {balanceBusy ? 'Membaca saldo…' : 'SELL ALL'}
+                      </button>
+                    </div>
                     <input
                       type="text"
+                      disabled={balanceBusy || isBusy}
                       value={tradeAmountInput}
                       onChange={(e) => setTradeAmountInput(e.target.value)}
                       className="w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 font-mono text-sm text-zinc-100 outline-none focus:border-emerald-500"
@@ -2013,9 +2124,12 @@ export default function App(): React.ReactElement {
                   </div>
                 </div>
 
+                {balanceError && <p role="alert" className="mt-2 text-xs text-rose-300">Gagal membaca saldo: {balanceError}. Coba tekan SELL ALL lagi.</p>}
+                {poolMode !== executionMode && <p className="mt-2 text-xs text-amber-300">Pool dibuat di mode {poolMode}. Kembali ke mode tersebut untuk swap.</p>}
+                {tradeSide === 'SELL' && !swapQuote && <p className="mt-2 text-xs text-amber-300">Estimasi tidak tersedia: periksa jumlah, output minimum, dan cadangan SOL riil pool.</p>}
                 <button
                   type="button"
-                  disabled={!swapQuote || isBusy}
+                  disabled={!swapQuote || isBusy || claimBusy || balanceBusy || poolMode !== executionMode}
                   onClick={handleExecuteSwap}
                   className={`mt-3 w-full rounded-lg px-4 py-2 text-xs font-semibold transition disabled:opacity-50 ${
                     tradeSide === 'BUY'

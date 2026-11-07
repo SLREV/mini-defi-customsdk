@@ -309,6 +309,12 @@ anchor build     # Build smart contract Rust (butuh Anchor CLI 0.31.1 + Agave >=
 anchor deploy    # Deploy program mini_amm ke devnet
 ```
 
+### SELL ALL dan Copy Mint
+
+Setelah pool muncul di dashboard, tekan **SELL ALL** pada Swap Terminal untuk memilih sisi jual dan mengisi jumlah dengan saldo penuh hingga 9 desimal. Pada Devnet saldo dibaca ulang dari associated token account (ATA) wallet aktif yang digunakan oleh transaksi swap; token yang tersimpan di akun token lain tidak termasuk. Periksa estimasi, lalu tekan tombol **Jual** dan konfirmasi di wallet. SELL ALL tidak langsung mengirim transaksi. Swap tetap dapat ditolak jika output dibulatkan menjadi nol, cadangan riil kurang, atau kondisi pool berubah. Tidak ada pengaturan `min_amount_out = 0` atau penutupan ATA otomatis.
+
+Pada informasi pool, kolom **Mint token (token_y)** dan tombol **Copy Mint** menyalin alamat mint lengkap; jika clipboard tidak tersedia, pilih dan salin teks secara manual. Dashboard saat ini menampilkan pool yang dibuat selama sesi, bukan pencarian pool lama melalui alamat mint.
+
 Mode **Binary Sandbox** di dashboard menjalankan seluruh pipeline (mint Token-2022 → inisialisasi pool → swap → deserialisasi 281B `PoolState`) terhadap ledger in-memory dengan serialisasi instruksi yang **sama persis** seperti transaksi on-chain; mode **Devnet RPC** mengirim transaksi sungguhan melalui wallet (Phantom atau keypair ephemeral).
 
 ## Menjalankan di Devnet (Checklist)

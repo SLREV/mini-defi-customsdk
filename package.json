@@ -12,7 +12,7 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview --host 0.0.0.0 --port 4173",
     "typecheck": "tsc --noEmit",
-    "test": "tsx tests/verifySdk.ts && tsx tests/verifyPinata.ts && tsx tests/verifyPinataApi.ts && tsx tests/verifyClaimCreator.ts && tsx tests/verifyToolchain.ts",
+    "test": "tsx tests/verifySdk.ts && tsx tests/verifyPinata.ts && tsx tests/verifyPinataApi.ts && tsx tests/verifyClaimCreator.ts && tsx tests/verifyToolchain.ts && tsx tests/verifyTradeUtils.ts",
     "anchor:build": "anchor build",
     "anchor:deploy": "anchor deploy --provider.cluster devnet",
     "toolchain:check": "tsx scripts/toolchainDoctor.ts",
