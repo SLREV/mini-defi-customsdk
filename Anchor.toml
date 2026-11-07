@@ -19,10 +19,10 @@ solana_version = "4.4.1"
 skip-lint = false
 
 [programs.localnet]
-mini_amm = "Csre71k9LDyYGx4t2hiG6VT4wiymuhPVXeksqe6Z83Hp"
+mini_amm = "DnW4iMWC5gCjPZkk2kkdTrY5uybW3w6r6aLdS6meynMn"
 
 [programs.devnet]
-mini_amm = "Csre71k9LDyYGx4t2hiG6VT4wiymuhPVXeksqe6Z83Hp"
+mini_amm = "DnW4iMWC5gCjPZkk2kkdTrY5uybW3w6r6aLdS6meynMn"
 
 [registry]
 url = "https://api.apr.dev"

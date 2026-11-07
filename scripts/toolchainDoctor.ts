@@ -18,7 +18,7 @@
  *   npm run toolchain:check -- --json
  */
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 /** Edition 2024 stabil sejak rustc 1.85 — di bawah ini manifest gagal di-parse. */
@@ -61,10 +61,89 @@ export function formatVersion(v: Version | null): string {
   return v ? `${v.major}.${v.minor}.${v.patch}` : 'tidak terbaca';
 }
 
+const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+
+/**
+ * Encode byte menjadi base58 (algoritma sama dengan `bs58`):
+ * digit dihitung little-endian lalu dibalik; nol di depan menjadi '1'.
+ */
+export function encodeBase58(bytes: Uint8Array): string {
+  const digits: number[] = [0];
+  for (const byte of bytes) {
+    let carry = byte;
+    for (let i = 0; i < digits.length; i += 1) {
+      carry += digits[i] << 8;
+      digits[i] = carry % 58;
+      carry = (carry / 58) | 0;
+    }
+    while (carry > 0) {
+      digits.push(carry % 58);
+      carry = (carry / 58) | 0;
+    }
+  }
+
+  let out = '';
+  // Nol di depan → karakter '1'. Elemen terakhir tidak dihitung karena
+  // digit awal [0] sudah menghasilkan satu '1'.
+  for (let k = 0; k < bytes.length - 1 && bytes[k] === 0; k += 1) {
+    out += BASE58_ALPHABET[0];
+  }
+  for (let q = digits.length - 1; q >= 0; q -= 1) {
+    out += BASE58_ALPHABET[digits[q]];
+  }
+  return out;
+}
+
+/**
+ * Program ID default di `src/sdk/customSdk.ts` — dibaca dari fallback
+ * `AMM_PROGRAM_ID_OVERRIDE || '<pubkey>'`.
+ */
+export function parseSdkProgramId(sdkTs: string): string | null {
+  const m = sdkTs.match(/AMM_PROGRAM_ID_OVERRIDE\s*\|\|\s*'([1-9A-HJ-NP-Za-km-z]{32,44})'/);
+  return m ? m[1] : null;
+}
+
+/** Baca satu nilai dari file `.env` (`KEY=value`, abaikan komentar). */
+export function readEnvValue(envPath: string, key: string): string | null {
+  if (!existsSync(envPath)) {
+    return null;
+  }
+  for (const rawLine of readFileSync(envPath, 'utf8').split('\n')) {
+    const line = rawLine.trim();
+    if (line.startsWith('#') || !line.startsWith(`${key}=`)) {
+      continue;
+    }
+    const value = line.slice(key.length + 1).trim().replace(/^["']|["']$/g, '');
+    return value.length > 0 ? value : null;
+  }
+  return null;
+}
+
+/** Baca `declare_id!("...")` dari `programs/mini-amm/src/lib.rs`. */
+export function parseDeclareId(libRs: string): string | null {
+  const m = libRs.match(/declare_id!\s*\(\s*"(\w+)"\s*\)/);
+  return m ? m[1] : null;
+}
+
+/** Pubkey dari isi `target/deploy/<program>-keypair.json` (array 64 byte). */
+export function pubkeyFromKeypairJson(json: string): string | null {
+  try {
+    const arr = JSON.parse(json) as number[];
+    if (!Array.isArray(arr) || arr.length !== 64) {
+      return null;
+    }
+    // 32 byte terakhir = public key
+    return encodeBase58(Uint8Array.from(arr.slice(32)));
+  } catch {
+    return null;
+  }
+}
+
 export type ToolchainVerdict =
   | 'ok'
   | 'edition2024-blocked'
   | 'anchor-manifest-incompatible'
+  | 'program-id-mismatch'
   | 'missing-binary'
   | 'unknown';
 
@@ -78,8 +157,35 @@ export interface ToolchainReport {
   msrvAwareResolver: boolean;
   /** true bila Cargo.toml memakai resolver yang ditolak Anchor 0.31.1 (`3`). */
   anchorManifestIncompatible: boolean;
+  /** Pubkey program di declare_id! (programs/mini-amm/src/lib.rs). */
+  declareId: string | null;
+  /** Pubkey dari target/deploy/mini_amm-keypair.json (yang benar-benar di-deploy). */
+  deployKeypairPubkey: string | null;
+  /** Program ID yang dipanggil dashboard/SDK (VITE_AMM_PROGRAM_ID atau isi customSdk.ts). */
+  sdkProgramId: string | null;
+  /** Nilai VITE_AMM_PROGRAM_ID di .env (null bila tidak ada). */
+  envAmmProgramId: string | null;
+  /** true bila program yang dipanggil dashboard berbeda dari keypair deploy. */
+  programIdMismatch: boolean;
+  /** true bila declare_id! tidak sama dengan program ID yang dipanggil dashboard. */
+  declareIdStale: boolean;
+  /** true bila `dist/` ada tapi berisi program ID lama (browser akan pakai ID basi). */
+  distStale: boolean;
   binary: string | null;
   hints: string[];
+}
+
+/** Kumpulkan file di dalam `dir` (rekursif) yang cocok dengan `pattern`. */
+export function findFiles(dir: string, pattern: RegExp, acc: string[] = []): string[] {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      findFiles(full, pattern, acc);
+    } else if (pattern.test(entry.name)) {
+      acc.push(full);
+    }
+  }
+  return acc;
 }
 
 /** Jalankan perintah, kembalikan stdout+stderr atau `null` bila tidak ada. */
@@ -155,6 +261,31 @@ export function inspectToolchain(root = process.cwd()): ToolchainReport {
   const rustc = raw ? parseVersion(raw, 'rustc') : null;
   const platformTools = raw ? parsePlatformTools(raw) : null;
 
+  const libRsPath = join(root, 'programs', 'mini-amm', 'src', 'lib.rs');
+  const declareId = existsSync(libRsPath)
+    ? parseDeclareId(readFileSync(libRsPath, 'utf8'))
+    : null;
+  // Program ID yang benar-benar dipanggil dashboard & script.
+  const sdkPath = join(root, 'src', 'sdk', 'customSdk.ts');
+  const sdkProgramId = existsSync(sdkPath)
+    ? parseSdkProgramId(readFileSync(sdkPath, 'utf8'))
+    : null;
+  const envAmmProgramId = readEnvValue(join(root, '.env'), 'VITE_AMM_PROGRAM_ID');
+  // .env menang, lalu default SDK, terakhir declare_id! (repo tanpa SDK).
+  const effectiveProgramId = envAmmProgramId ?? sdkProgramId ?? declareId;
+  const keypairJsonPath = join(root, 'target', 'deploy', 'mini_amm-keypair.json');
+  const deployKeypairPubkey = existsSync(keypairJsonPath)
+    ? pubkeyFromKeypairJson(readFileSync(keypairJsonPath, 'utf8'))
+    : null;
+  const programIdMismatch =
+    effectiveProgramId !== null &&
+    deployKeypairPubkey !== null &&
+    effectiveProgramId !== deployKeypairPubkey;
+  const declareIdStale =
+    declareId !== null &&
+    effectiveProgramId !== null &&
+    declareId !== effectiveProgramId;
+
   const deployDir = join(root, 'target', 'deploy');
   const binary = existsSync(join(deployDir, 'mini_amm.so'))
     ? join(deployDir, 'mini_amm.so')
@@ -196,6 +327,35 @@ export function inspectToolchain(root = process.cwd()): ToolchainReport {
     hints.push(`Toolchain SBF memakai rustc ${formatVersion(rustc)} (edition 2024 didukung).`);
   }
 
+  if (programIdMismatch) {
+    verdict = 'program-id-mismatch';
+    hints.push(
+      'PROGRAM ID TIDAK COCOK: yang dipanggil dashboard/SDK = ' +
+        `${effectiveProgramId}` +
+        (envAmmProgramId ? ' (dari .env VITE_AMM_PROGRAM_ID)' : ' (dari src/sdk/customSdk.ts)') +
+        `, tetapi target/deploy/mini_amm-keypair.json = ${deployKeypairPubkey}.`
+    );
+    hints.push(
+      'anchor deploy memakai keypair itu, jadi program mendarat di alamat yang BUKAN ' +
+        'dipanggil dashboard/scripts. Pilih salah satu:'
+    );
+    hints.push(
+      `  (a) ikuti keypair deploy: set VITE_AMM_PROGRAM_ID=${deployKeypairPubkey} di .env, ` +
+        'samakan [programs.*] di Anchor.toml + declare_id! (anchor keys sync), lalu rebuild.'
+    );
+    hints.push(
+      '  (b) paksa alamat lama: taruh keypair program yang benar di ' +
+        'target/deploy/mini_amm-keypair.json, lalu `anchor clean && anchor build`.'
+    );
+  }
+
+  if (declareIdStale && !programIdMismatch) {
+    hints.push(
+      `declare_id! (${declareId}) berbeda dari program ID yang dipanggil dashboard (${effectiveProgramId}). ` +
+        'Jalankan `anchor keys sync` lalu `anchor clean && anchor build` agar binary dan SDK sepakat.'
+    );
+  }
+
   if (anchorManifestIncompatible) {
     verdict = 'anchor-manifest-incompatible';
     hints.push(
@@ -217,6 +377,28 @@ export function inspectToolchain(root = process.cwd()): ToolchainReport {
     );
   }
 
+  // Bundle hasil build (`dist/`) bisa tertinggal setelah program ID berubah.
+  // Kalau ia masih memuat ID lama, `npm run preview` akan memakai ID basi.
+  const distDir = join(root, 'dist');
+  let distStale = false;
+  if (existsSync(distDir) && effectiveProgramId) {
+    for (const asset of findFiles(distDir, /\.[cm]?js$/)) {
+      const text = readFileSync(asset, 'utf8');
+      if (!text.includes(effectiveProgramId)) {
+        distStale = true;
+        break;
+      }
+    }
+  }
+  if (distStale) {
+    hints.push(
+      'dist/ berisi bundle LAMA (program ID di dalamnya bukan ' +
+        effectiveProgramId +
+        '). Jalankan `npm run build` ulang, atau hapus dist/ — kalau tidak, ' +
+        '`npm run preview`/server statis akan memakai ID basi.'
+    );
+  }
+
   hints.push(
     binary
       ? `Binary siap deploy: ${binary}`
@@ -233,6 +415,13 @@ export function inspectToolchain(root = process.cwd()): ToolchainReport {
     resolver,
     msrvAwareResolver,
     anchorManifestIncompatible,
+    declareId,
+    sdkProgramId,
+    envAmmProgramId,
+    deployKeypairPubkey,
+    programIdMismatch,
+    declareIdStale,
+    distStale,
     binary,
     hints,
   };
@@ -251,6 +440,7 @@ function main(): void {
     ok: '\u2714 OK',
     'edition2024-blocked': '\u2716 TERBLOKIR edition2024',
     'anchor-manifest-incompatible': '\u2716 MANIFEST DITOLAK ANCHOR',
+    'program-id-mismatch': '\u2716 PROGRAM ID TIDAK COCOK',
     'missing-binary': '\u26a0 cargo-build-sbf tidak ada',
     unknown: '\u26a0 versi tidak terbaca',
   };
@@ -273,6 +463,15 @@ function main(): void {
   );
   console.log(
     `Resolver MSRV   : ${report.msrvAwareResolver ? 'aktif' : `belum (resolver=${report.resolver ?? '-'})`}`
+  );
+  console.log(`dist (bundle)   : ${report.distStale ? '\u2716 BASI — jalankan npm run build' : 'ok / belum ada'}`);
+  console.log(`declare_id!     : ${report.declareId ?? 'tidak terbaca'}`);
+  console.log(
+    `SDK / .env      : ${report.envAmmProgramId ?? report.sdkProgramId ?? 'tidak terbaca'}` +
+      (report.envAmmProgramId ? ' (dari .env)' : ' (dari customSdk.ts)')
+  );
+  console.log(
+    `deploy keypair  : ${report.deployKeypairPubkey ?? 'belum ada (dibuat saat build pertama)'}`
   );
   console.log('');
   for (const hint of report.hints) {

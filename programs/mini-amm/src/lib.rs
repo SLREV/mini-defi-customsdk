@@ -6,7 +6,7 @@ use anchor_spl::{
     },
 };
 
-declare_id!("Csre71k9LDyYGx4t2hiG6VT4wiymuhPVXeksqe6Z83Hp");
+declare_id!("DnW4iMWC5gCjPZkk2kkdTrY5uybW3w6r6aLdS6meynMn");
 
 pub const AMM_POOL_SEED: &[u8] = b"amm_pool";
 pub const LP_MINT_SEED: &[u8] = b"lp_mint";

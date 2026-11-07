@@ -309,7 +309,9 @@ Mode **Binary Sandbox** di dashboard menjalankan seluruh pipeline (mint Token-20
 
 Mode **Devnet RPC** hanya bisa dipakai setelah 3 hal ini terpenuhi:
 
-1. **Program ter-deploy** pada program ID yang sama dengan `declare_id!` (`Csre71k9LDyYGx4t2hiG6VT4wiymuhPVXeksqe6Z83Hp`) di cluster devnet.
+1. **Program ter-deploy** pada program ID yang sama dengan `declare_id!`
+   (`DnW4iMWC5gCjPZkk2kkdTrY5uybW3w6r6aLdS6meynMn`) di cluster devnet, dan binary-nya
+   dikompilasi dengan ID tersebut (kalau tidak → `DeclaredProgramIdMismatch` / `0x1004`).
 2. **Wallet punya SOL devnet** (minimal ~0.1 SOL untuk fee + rent ATA/mint/pool).
 3. **RPC dapat diakses dari browser** (endpoint publik `api.devnet.solana.com` bisa kena rate-limit).
 
@@ -376,6 +378,8 @@ Selain itu dashboard mencetak ringkasan layout transaksi ke console (`console.ta
 | :--- | :--- |
 | `feature \`edition2024\` is required` saat `anchor build` | Cargo bawaan toolchain SBF masih 1.84. Lihat bagian **Gagal `anchor build`: feature `edition2024`** di bawah. |
 | `unknown variant \`3\`, expected \`1\` or \`2\`` | `resolver = "3"` di `Cargo.toml` — ditolak Anchor 0.31.1. Pakai `resolver = "2"` dan aktifkan MSRV-aware lewat `.cargo/config.toml`. |
+| `Attempt to load a program that does not exist` padahal deploy "sukses" | Dashboard memanggil alamat yang salah. Set `VITE_AMM_PROGRAM_ID=<Program Id dari deploy>` di `.env`, atau `anchor keys sync` + rebuild + deploy ulang. Cek `npm run toolchain:check`. |
+| `DeclaredProgramIdMismatch` / `0x1004` saat kirim transaksi | Binary dikompilasi untuk `declare_id!` berbeda dari alamat deploy. Samakan `declare_id!` lalu `anchor build && anchor upgrade --program-id <ID> target/deploy/mini_amm.so`. `npm run devnet:check` mendeteksi ini sebelum transaksi dikirim. |
 | `cargo-build-sbf` masih melaporkan rustc 1.84 setelah install Agave baru | Binary lama menang di `PATH`. Cek `which -a cargo-build-sbf`, pastikan `~/.local/share/solana/install/active_release/bin` ada di depan. |
 | `Downloading platform-tools v1.57 ... (506 MiB)` | Normal, sekali saja. `cargo-build-sbf` versi baru mengunduh toolchain SBF pertama kali dipakai. Jangan dihentikan. |
 | `warning: This cargo-build-sbf was installed with the Solana CLI` | Tidak berbahaya — itu `cargo-build-sbf` baru yang menyadari ada binary lain di `~/.cargo/bin`. Lihat catatan `PATH` di bagian edition2024. |
@@ -505,6 +509,112 @@ npm run toolchain:check -- --json
 Skrip ini membaca `cargo-build-sbf --version`, membandingkan rustc dengan ambang 1.85,
 memeriksa `solana_version` di `Anchor.toml` serta status resolver MSRV, dan memberi tahu
 apakah `target/deploy/mini_amm.so` sudah ada.
+
+## Program ID: `declare_id!` harus sama dengan alamat deploy
+
+Ada **dua** kegagalan berbeda yang berakar pada hal yang sama, dan keduanya sudah pernah
+terjadi di repo ini:
+
+| Gejala | Arti |
+| :--- | :--- |
+| `Attempt to load a program that does not exist` | Dashboard memanggil alamat X, program tidak ada di X |
+| `DeclaredProgramIdMismatch` (Anchor **4100**, custom error **0x1004**) | Program **ada**, tetapi binary-nya dikompilasi untuk ID lain |
+
+### Kenapa `0x1004` muncul
+
+Anchor menanam `declare_id!` ke dalam binary dan memeriksanya di **baris pertama** setiap
+instruksi (`lang/syn/src/codegen/program/entry.rs`):
+
+```rust
+if *program_id != ID {
+    return Err(anchor_lang::error::ErrorCode::DeclaredProgramIdMismatch.into());
+}
+```
+
+Jadi kalau binary dengan `declare_id!("A")` di-deploy ke alamat `B`, **semua** instruksi
+ditolak — bukan hanya sebagian. Log-nya:
+
+```
+Program log: AnchorError occurred. Error Code: DeclaredProgramIdMismatch.
+          Error Number: 4100. Error Message: The declared program id does not match the actual program id.
+```
+
+Penyebab paling umum: `anchor build` di folder tanpa `target/deploy/mini_amm-keypair.json`
+(ZIP / setelah `anchor clean`) membuat keypair **baru**, sehingga `anchor deploy` mendarat di
+alamat baru sementara `declare_id!` masih alamat lama.
+
+### Perbaikan untuk program yang sudah ter-deploy di ID lain
+
+Pakai ID yang **sudah** ter-deploy (jangan deploy baru). `anchor upgrade` mempertahankan
+program ID karena ia memanggil `solana program deploy --program-id <ID>`:
+
+```bash
+# 1. Samakan declare_id! (dan Anchor.toml / SDK) ke alamat yang sudah ter-deploy
+#    di repo ini semuanya sudah disetel ke:
+#    DnW4iMWC5gCjPZkk2kkdTrY5uybW3w6r6aLdS6meynMn
+
+# 2. Verifikasi semuanya sepakat
+npm run toolchain:check     # declare_id!, SDK/.env, dan keypair deploy
+npm run devnet:check        # cek jaringan: declare_id! vs akun program on-chain
+
+# 3. Build ulang (binary harus meng-embed ID yang benar)
+anchor clean && anchor build
+
+# 4. Kirim binary baru ke program ID yang sama
+anchor upgrade --program-id DnW4iMWC5gCjPZkk2kkdTrY5uybW3w6r6aLdS6meynMn \
+  target/deploy/mini_amm.so
+```
+
+Setelah itu `npm run dev` → mode **Devnet RPC** siap dipakai.
+
+> Kalau Anda ingin memakai alamat lain lagi: ubah **empat** tempat sekaligus —
+> `declare_id!` di `programs/mini-amm/src/lib.rs`, dua entri di `[programs.*]` `Anchor.toml`,
+> fallback di `src/sdk/customSdk.ts` (atau `VITE_AMM_PROGRAM_ID` di `.env`), lalu
+> `anchor clean && anchor build`. `npm run toolchain:check` akan menandai kalau ada yang
+> tertinggal.
+
+### Dashboard masih memakai program ID lama (bundle basi)
+
+Kalau pesan error di browser masih menyebut alamat lama padahal `declare_id!` dan program
+sudah benar, berarti **browser menjalankan kode lama**, bukan program yang salah.
+
+Penyebab yang paling sering, berurutan:
+
+1. **Server dev dijalankan sebelum file diubah.** Vite hanya membaca ulang file saat start;
+   `src/sdk/customSdk.ts` yang berubah setelah `npm run dev` tidak ikut terpakai.
+   → Hentikan (`Ctrl+C`) lalu jalankan `npm run dev` lagi.
+2. **Halaman tidak reload.** Vite HMR kadang tidak mengganti modul SDK karena ia di-import
+   di level teratas. → `Ctrl+Shift+R` (hard reload).
+3. **`npm run preview` / server statis menyajikan `dist/` lama.** → `npm run build` ulang,
+   atau hapus `dist/`.
+
+Cara memastikan dalam sekali lihat: header dashboard menampilkan stempel build
+
+```
+build 2026.11.07 · creatorFee=6bps · mintToChecked=3akun · programId=DnW4iMWC5
+```
+
+Kalau **`programId=` masih ID lama** (atau stempelnya tidak memuat `programId=` sama sekali),
+browser Anda jelas memakai source basi. Pesan error transaksi juga menyertakan stempel ini.
+
+Dari terminal, periksa tanpa membuka browser:
+
+```bash
+npm run toolchain:check     # baris "dist (bundle): ok / BASI"
+```
+
+`BASI` berarti ada file `.js` di `dist/` yang tidak memuat program ID aktif.
+
+### Kalau memilih deploy baru (bukan upgrade)
+
+```bash
+anchor keys sync      # declare_id! + Anchor.toml ikut target/deploy
+anchor clean && anchor build
+anchor deploy --provider.cluster devnet
+```
+
+Ingat: `anchor keys sync` **mengubah** `declare_id!`, jadi build ulang wajib — kalau tidak,
+binary lama tetap meng-embed ID lama dan `0x1004` muncul lagi.
 
 ## Catatan Perbaikan Terakhir
 

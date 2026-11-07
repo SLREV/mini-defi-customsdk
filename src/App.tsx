@@ -127,7 +127,22 @@ const describeRpcError = (err: unknown, rpcEndpoint: string): string => {
       haystack
     )
   ) {
-    return `Program AMM ${DEFAULT_AMM_PROGRAM_ID.toBase58()} belum ter-deploy di ${rpcEndpoint}. Jalankan "anchor build && anchor deploy --provider.cluster devnet" terlebih dahulu.`;
+    return `Program AMM ${DEFAULT_AMM_PROGRAM_ID.toBase58()} belum ter-deploy di ${rpcEndpoint}. Jalankan "anchor build && anchor deploy --provider.cluster devnet" terlebih dahulu. (build ${SDK_BUILD_TAG} — kalau ID di atas bukan program yang baru Anda deploy, browser masih memuat bundle lama: tekan Ctrl+Shift+R atau jalankan "npm run build" ulang.)`;
+  }
+  // Anchor ErrorCode 4100 / custom error 0x1004: binary yang ter-deploy
+  // dikompilasi dengan declare_id! berbeda dari alamat tempat ia di-deploy.
+  // Setiap instruksi ditolak di entrypoint, jadi pesannya harus sangat jelas.
+  if (/DeclaredProgramIdMismatch|0x1004/i.test(haystack)) {
+    const failedIx = raw.match(/Error processing Instruction (\d+)/i)?.[1];
+    const tail = logs && logs.length > 0 ? `\nLog: ${logs.slice(-2).join(' | ')}` : '';
+    return [
+      `Instruksi ${failedIx ?? '?'} gagal: DeclaredProgramIdMismatch (Anchor 4100 / 0x1004).`,
+      `Program di ${DEFAULT_AMM_PROGRAM_ID.toBase58()} dikompilasi untuk program ID yang berbeda,`,
+      'jadi Anchor menolak semua instruksi di entrypoint.',
+      'Perbaikan: samakan declare_id! dengan alamat deploy (yang sudah dipakai di sini), lalu',
+      '  anchor build && anchor upgrade --program-id ' +
+        `${DEFAULT_AMM_PROGRAM_ID.toBase58()} target/deploy/mini_amm.so`,
+    ].join(' ') + tail;
   }
   if (/insufficient (funds|lamports)|InsufficientFundsForRent|0x1/i.test(haystack)) {
     return `Saldo SOL wallet tidak cukup untuk fee/rent di ${rpcEndpoint}. Di devnet klik "Airdrop 1 SOL" atau pakai faucet.solana.com.`;
