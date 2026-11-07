@@ -84,8 +84,24 @@ assert.equal(ok.resolver, '2');
 assert.equal(ok.anchorManifestIncompatible, false);
 assert.equal(ok.msrvAwareResolver, true);
 assert.equal(ok.anchorSolanaVersion, '4.4.1');
-// Tanpa cargo-build-sbf di PATH, verdict-nya "missing-binary" tetapi hint binary tetap benar.
-assert.ok(['ok', 'missing-binary'].includes(ok.verdict));
+// Verdict mencerminkan MESIN yang menjalankan tes, bukan repo, jadi tidak
+// dipatok ke satu nilai:
+//   ok                       -> toolchain modern & repo sehat
+//   missing-binary/unknown   -> tanpa cargo-build-sbf / versi tak terbaca
+//   edition2024-blocked      -> cargo-build-sbf di mesin ini masih rustc < 1.85
+// Yang penting hanya: veredict TIDAK boleh menyalahkan repo, karena fixture ini
+// sudah benar (resolver 2, config MSRV-aware, binary ada). Dua verdict repo-lah
+// yang harus mustahil muncul.
+assert.notEqual(
+  ok.verdict,
+  'anchor-manifest-incompatible',
+  `fixture sehat tidak boleh dianggap manifest rusak: ${ok.verdict}`
+);
+assert.notEqual(
+  ok.verdict,
+  'program-id-mismatch',
+  `fixture sehat tidak boleh dianggap ID mismatch: ${ok.verdict}`
+);
 assert.ok(ok.hints.some((h) => h.includes('Binary siap deploy')));
 
 // 5. Laporan untuk repo tanpa perlindungan MSRV: hint resolver 3 muncul
@@ -284,7 +300,40 @@ writeFileSync(join(distRoot, 'dist', 'assets', 'a.js'), 'x');
 writeFileSync(join(distRoot, 'dist', 'assets', 'b.css'), 'x');
 assert.equal(findFiles(join(distRoot, 'dist'), /\.js$/).length, 1);
 
-// 11. Repo asli: konfigurasi yang dikomit memang MSRV-aware
+// 11. Parser harus memahami output NYATA `cargo-build-sbf --version`.
+//     Bentuk asli (Agave 4.5.0):
+//       cargo-build-sbf 4.5.0 Default platform-tools: v1.57 Default Rust: 1.95.0
+//     Perhatikan: tidak ada kata "rustc", dan ada titik dua setelah
+//     "platform-tools". Keduanya dulu membuat parseVersion/parsePlatformTools
+//     mengembalikan null sehingga doctor melaporkan "tidak terbaca" dan
+//     verdict jatuh ke "unknown" (inilah yang menggagalkan `npm test`).
+const realVersionOutput =
+  'cargo-build-sbf 4.5.0 Default platform-tools: v1.57 Default Rust: 1.95.0';
+assert.deepEqual(
+  parseVersion(realVersionOutput, 'rustc'),
+  { major: 1, minor: 95, patch: 0 },
+  'versi rustc harus terbaca dari "Default Rust: 1.95.0"'
+);
+assert.equal(parsePlatformTools(realVersionOutput), 157, 'platform-tools v1.57 -> 157');
+assert.ok(
+  parsePlatformTools(realVersionOutput)! >= MIN_PLATFORM_TOOLS,
+  'v1.57 harus dianggap memadai'
+);
+
+// Bentuk lama tetap harus jalan (jangan regresi).
+assert.deepEqual(
+  parseVersion('cargo-build-sbf 4.4.0 (platform-tools v1.53, rustc 1.89.0)', 'rustc'),
+  { major: 1, minor: 89, patch: 0 }
+);
+assert.equal(parsePlatformTools('platform-tools v1.53'), 153);
+assert.equal(parseVersion('tidak ada versi di sini', 'rustc'), null);
+assert.equal(parsePlatformTools('tanpa platform tools'), null);
+
+// Label di laporan tidak boleh berbunyi "belum" hanya karena config fallback
+// tidak diperlukan (rustc modern + resolver 2 sudah cukup).
+assert.ok(parseSolanaVersion('[toolchain]\nsolana_version = "4.4.1"') === '4.4.1');
+
+// 12. Repo asli: konfigurasi yang dikomit memang MSRV-aware
 const repo = inspectToolchain(REPO);
 assert.equal(repo.resolver, '2', 'Cargo.toml root wajib resolver = "2" (Anchor 0.31.1 menolak "3")');
 assert.equal(

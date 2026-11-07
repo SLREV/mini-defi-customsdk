@@ -510,6 +510,26 @@ Skrip ini membaca `cargo-build-sbf --version`, membandingkan rustc dengan ambang
 memeriksa `solana_version` di `Anchor.toml` serta status resolver MSRV, dan memberi tahu
 apakah `target/deploy/mini_amm.so` sudah ada.
 
+Output yang diharapkan pada Agave 4.5.x:
+
+```
+Status          : ✔ OK
+cargo-build-sbf : cargo-build-sbf 4.5.0 Default platform-tools: v1.57 Default Rust: 1.95.0
+rustc SBF       : 1.95.0 (minimal 1.85)
+platform-tools  : v1.57
+```
+
+> **Catatan format output.** `cargo-build-sbf --version` **tidak** menyebut kata `rustc`;
+> versinya ada di `Default Rust: 1.95.0`, dan platform-tools memakai titik dua
+> (`platform-tools: v1.57`). Parser di `scripts/toolchainDoctor.ts` menangani kedua bentuk
+> ini (dan bentuk lama `rustc 1.89.0` / `platform-tools v1.53`). Kalau suatu saat muncul
+> `versi tidak terbaca` padahal versinya jelas ada, tambahkan bentuk baru ke
+> `parseVersion()` / `parsePlatformTools()` dan ke bagian 11 `tests/verifyToolchain.ts`.
+
+`Resolver MSRV` melaporkan dua hal berbeda: `resolver = "2"` (wajib, agar Anchor bisa
+mem-parse `Cargo.toml`) dan `.cargo/config.toml` MSRV-aware (opsional bila rustc SBF sudah
+>= 1.85). Toolchain modern akan menunjukkan `tidak perlu (resolver=2, rustc SBF sudah >= 1.85)`.
+
 ## Program ID: `declare_id!` harus sama dengan alamat deploy
 
 Ada **dua** kegagalan berbeda yang berakar pada hal yang sama, dan keduanya sudah pernah
