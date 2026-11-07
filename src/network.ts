@@ -1,8 +1,8 @@
 import { Connection, PublicKey } from '@solana/web3.js';
 
-export type RpcNetwork = 'DEVNET' | 'MAINNET';
+export type RpcNetwork = 'LOCAL' | 'DEVNET' | 'MAINNET';
 export type ExecutionMode = 'SANDBOX' | RpcNetwork;
-export const NETWORK_GENESIS: Record<RpcNetwork, string> = {
+export const NETWORK_GENESIS: Record<'DEVNET' | 'MAINNET', string> = {
   DEVNET: 'EtWTRABZaYq6iMfeYKouRu166VU2xqa1',
   MAINNET: '5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp',
 };
@@ -10,6 +10,15 @@ export const NETWORK_GENESIS: Record<RpcNetwork, string> = {
 /** Never trust an RPC URL's name: require the actual cluster genesis hash. */
 export async function assertRpcNetwork(connection: Pick<Connection, 'getGenesisHash'>, network: RpcNetwork): Promise<void> {
   const actual = await connection.getGenesisHash();
+  if (network === 'LOCAL') {
+    // A validator creates a new genesis on each reset, so reject known public clusters.
+    // This does not cryptographically prove the server is a local validator.
+    const publicGenesis = [NETWORK_GENESIS.DEVNET, NETWORK_GENESIS.MAINNET, '4uhcVJyU9pJkvQyS88uRDiswHXSCkY3z'];
+    if (!actual || publicGenesis.includes(actual)) {
+      throw new Error('RPC lokal menunjuk ke cluster publik; transaksi dibatalkan.');
+    }
+    return;
+  }
   if (actual !== NETWORK_GENESIS[network]) {
     throw new Error(`RPC bukan jaringan ${network}. Periksa URL RPC sebelum melanjutkan.`);
   }
@@ -46,6 +55,6 @@ export function assertMainnetWallet(
 /** A separate explicit mainnet program ID avoids assuming devnet deployments exist there. */
 export function resolveProgramId(network: RpcNetwork, value: string | undefined, devnetDefault: PublicKey): PublicKey | null {
   const configured = value?.trim();
-  if (!configured) return network === 'DEVNET' ? devnetDefault : null;
+  if (!configured) return network === 'MAINNET' ? null : devnetDefault;
   try { return new PublicKey(configured); } catch { return null; }
 }

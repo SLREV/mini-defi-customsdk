@@ -77,9 +77,71 @@ Anchor 0.31 mendukung **custom discriminator** 1 byte (`#[instruction(discrimina
 └── vite.config.ts
 ```
 
-## Pilihan jaringan: Sandbox, Devnet, Mainnet
+## Validator lokal dengan akun pilihan dari mainnet
 
-Dashboard memiliki tombol **Binary Sandbox**, **Devnet**, dan **MAINNET**. Default adalah Sandbox. Mainnet menggunakan SOL sungguhan, memerlukan wallet Phantom/injected (bukan mock keypair), persetujuan risiko, serta program AMM yang sudah di-deploy dan diverifikasi terpisah di mainnet. Program, token, pool dan saldo devnet tidak otomatis pindah ke mainnet. Tidak ada airdrop mainnet dan proyek ini belum diaudit; kode ini tidak membuat atau menambahkan instruksi remove liquidity.
+Mode **Local Validator** adalah jaringan uji lokal yang terpisah, **bukan mainnet asli dan bukan salinan seluruh mainnet**. Hanya akun WSOL dan program Token-2022 (beserta ProgramData-nya) disalin dari RPC mainnet; AMM menggunakan binary lokal Anda. Saldo/fee/rent lokal adalah SOL uji, tidak bernilai nyata dan tidak muncul di mainnet. Program, pool, dan wallet utama di mainnet tidak otomatis tersedia di validator ini.
+
+### 1. Build kontrak
+
+Di direktori proyek, gunakan toolchain Anchor/Agave yang sesuai:
+
+```bash
+anchor build
+```
+
+Skrip memerlukan `target/deploy/mini_amm.so` dan membaca program ID dari `declare_id!` di `programs/mini-amm/src/lib.rs`. Build ulang setelah mengubah program atau ID; skrip tidak membuktikan kesesuaian binary lama dengan source.
+
+### 2. Jalankan validator
+
+Di terminal pertama:
+
+```bash
+npm run local:validator
+```
+
+Skrip memeriksa genesis sumber mainnet, menjalankan `solana-test-validator --reset --bind-address 127.0.0.1`, menyimpan ledger di `.local-validator/ledger`, mengkloning `So11111111111111111111111111111111111111112` dan program `TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb` dengan `--clone-upgradeable-program` (menyalin program dan ProgramData), lalu memasukkan binary `--bpf-program` pada `declare_id!`. Ini menggunakan instalasi validator lokal, bukan deploy berbayar. Jika RPC publik membatasi akses, gunakan RPC mainnet lain dengan `LOCAL_VALIDATOR_MAINNET_RPC` sebagai variabel lingkungan shell.
+
+**PERINGATAN:** setiap menjalankan skrip, `--reset` menghapus isi `.local-validator/ledger`, termasuk seluruh pool, token, saldo, dan history lokal sebelumnya. Jangan gunakan direktori itu untuk data lain. Validator mungkin membuka port layanan lain termasuk faucet; lindungi dengan firewall dan jangan meneruskannya ke jaringan publik. `--bind-address` saja tidak menjamin seluruh layanan validator privat.
+
+### 3. Jalankan dashboard secara privat
+
+Di terminal kedua:
+
+```bash
+npm install
+npm run dev:private
+```
+
+Buka `http://127.0.0.1:5173` pada komputer yang sama, lalu pilih **Local Validator**. Vite mem-proxy HTTP dan WebSocket dari origin dashboard ke `127.0.0.1:8899` dan `127.0.0.1:8900` pada mesin yang menjalankan Vite. Ini bukan endpoint browser langsung; untuk hosting statis di luar Vite, perlu reverse proxy HTTP/WS yang ekuivalen. `npm run dev` standar mendengarkan `0.0.0.0` dan dapat mengekspos proxy; untuk penggunaan pribadi gunakan `dev:private` dan firewall. Genesis lokal berbeda setiap reset; aplikasi menolak genesis publik yang dikenal tetapi pemeriksaan ini bukan bukti kriptografis bahwa RPC yang tidak dipercaya benar-benar lokal. Jangan mempercayai proxy publik.
+
+Jika `declare_id!` berubah, samakan `VITE_LOCAL_AMM_PROGRAM_ID` di `.env` dengan ID tersebut (atau `VITE_AMM_PROGRAM_ID`) dan restart Vite. Local Validator menggunakan program ID lokal, sedangkan mode Devnet/Mainnet tetap mempertahankan endpoint dan ID masing-masing. Hubungkan wallet yang mendukung custom RPC lokal, lalu pastikan jaringan yang ditampilkan wallet juga lokal sebelum menandatangani. Untuk uji cepat dapat memakai **Connect Mock Keypair**, yang hanya ada dalam memori dan hilang saat halaman dimuat ulang.
+
+### 4. Airdrop ke wallet lokal
+
+Pilih **Local Validator**, hubungkan wallet, dan tekan **Airdrop 10 SOL lokal**. Atau gunakan CLI berikut untuk alamat publik wallet Phantom Anda (jangan masukkan seed phrase/private key):
+
+```bash
+read -r -p 'Alamat publik wallet Phantom: ' PHANTOM_ADDRESS
+solana airdrop 10 "$PHANTOM_ADDRESS" --url http://127.0.0.1:8899
+```
+
+Validator harus sudah berjalan. Konfirmasi saldo melalui `solana balance "$PHANTOM_ADDRESS" --url http://127.0.0.1:8899`. Jangan kirim SOL mainnet asli ke keypair mock; SOL lokal hanya berada pada ledger lokal. Setelah reset, muat ulang dashboard karena state pool dan saldo lokal sudah dihapus.
+
+Untuk kode Node SDK yang dijalankan dari root proyek:
+
+```typescript
+import { Connection } from '@solana/web3.js';
+import { CustomDefiSDK, DEFAULT_AMM_PROGRAM_ID } from './src/sdk/customSdk';
+
+const connection = new Connection('http://127.0.0.1:8899', 'confirmed');
+const sdk = new CustomDefiSDK(connection, DEFAULT_AMM_PROGRAM_ID);
+```
+
+SDK Node tidak memakai proxy browser dan tidak memengaruhi koneksi Devnet/Mainnet. Pastikan `DEFAULT_AMM_PROGRAM_ID` cocok dengan `declare_id!` lokal. Perlu tes end-to-end pada validator yang sebenarnya sebelum mengandalkan hasilnya.
+
+## Pilihan jaringan: Sandbox, Local Validator, Devnet, Mainnet
+
+Dashboard memiliki tombol **Binary Sandbox**, **Local Validator**, **Devnet**, dan **MAINNET**. Default adalah Sandbox. Mainnet menggunakan SOL sungguhan, memerlukan wallet Phantom/injected (bukan mock keypair), persetujuan risiko, serta program AMM yang sudah di-deploy dan diverifikasi terpisah di mainnet. Program, token, pool dan saldo devnet tidak otomatis pindah ke mainnet. Tidak ada airdrop mainnet dan proyek ini belum diaudit; kode ini tidak membuat atau menambahkan instruksi remove liquidity.
 
 Pada `.env`, atur:
 

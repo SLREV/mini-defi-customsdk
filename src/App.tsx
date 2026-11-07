@@ -91,6 +91,7 @@ const MAINNET_RPC_ENDPOINT =
   (import.meta.env.VITE_MAINNET_RPC_ENDPOINT as string | undefined)?.trim() ||
   'https://api.mainnet-beta.solana.com';
 
+const LOCAL_AMM_PROGRAM_ID = resolveProgramId('LOCAL', import.meta.env.VITE_LOCAL_AMM_PROGRAM_ID as string | undefined, DEFAULT_AMM_PROGRAM_ID);
 const MAINNET_AMM_PROGRAM_ID = resolveProgramId('MAINNET', import.meta.env.VITE_MAINNET_AMM_PROGRAM_ID as string | undefined, DEFAULT_AMM_PROGRAM_ID);
 const DEVNET_AMM_PROGRAM_ID = resolveProgramId('DEVNET', import.meta.env.VITE_DEVNET_AMM_PROGRAM_ID as string | undefined, DEFAULT_AMM_PROGRAM_ID);
 
@@ -378,16 +379,24 @@ export default function App(): React.ReactElement {
   const mainnetConnection = useMemo(
     () => new Connection(MAINNET_RPC_ENDPOINT, 'confirmed'), []
   );
-  const rpcConnection = executionMode === 'MAINNET' ? mainnetConnection : devnetConnection;
+  // Vite forwards HTTP/WS to the validator on the server's loopback interface.
+  // This keeps browser code from treating the browser's localhost as the server.
+  const localConnection = useMemo(() => {
+    const rpc = new URL('/local-validator-rpc', window.location.origin);
+    const ws = new URL('/local-validator-ws', window.location.origin);
+    ws.protocol = ws.protocol === 'https:' ? 'wss:' : 'ws:';
+    return new Connection(rpc.toString(), { commitment: 'confirmed', wsEndpoint: ws.toString() });
+  }, []);
+  const rpcConnection = executionMode === 'MAINNET' ? mainnetConnection : executionMode === 'LOCAL' ? localConnection : devnetConnection;
   const selectedProgramId = executionMode === 'MAINNET' ? MAINNET_AMM_PROGRAM_ID
-    : executionMode === 'DEVNET' ? DEVNET_AMM_PROGRAM_ID : DEFAULT_AMM_PROGRAM_ID;
+    : executionMode === 'DEVNET' ? DEVNET_AMM_PROGRAM_ID : executionMode === 'LOCAL' ? LOCAL_AMM_PROGRAM_ID : DEFAULT_AMM_PROGRAM_ID;
   const networkKey = `${executionMode}:${rpcConnection.rpcEndpoint}:${selectedProgramId?.toBase58() ?? ''}`;
   const rpcReady = executionMode === 'SANDBOX' || (networkStatus?.key === networkKey && networkStatus.state === 'ready');
   const operationAllowed = rpcReady && (executionMode !== 'MAINNET' ||
     (mainnetAcknowledged && walletType === 'INJECTED' && walletPubkey !== null));
   const rpcHost = executionMode === 'MAINNET'
     ? (() => { try { return new URL(MAINNET_RPC_ENDPOINT).host; } catch { return 'RPC'; } })()
-    : DEVNET_RPC_HOST;
+    : executionMode === 'LOCAL' ? 'validator lokal via proxy (127.0.0.1:8899)' : DEVNET_RPC_HOST;
 
   useEffect(() => {
     if (executionMode === 'SANDBOX') return;
@@ -653,35 +662,26 @@ export default function App(): React.ReactElement {
     setErrorMessage(null);
     setAirdropBusy(true);
     try {
-      if (executionMode !== 'DEVNET') {
-        throw new Error('Airdrop hanya tersedia pada mode Devnet RPC');
+      if (executionMode !== 'DEVNET' && executionMode !== 'LOCAL') {
+        throw new Error('Airdrop hanya tersedia di Devnet atau validator lokal');
       }
-      await assertRpcNetwork(devnetConnection, 'DEVNET');
-      const signature = await devnetConnection.requestAirdrop(
-        target,
-        LAMPORTS_PER_SOL
-      );
-      const latest = await devnetConnection.getLatestBlockhash('confirmed');
-      const confirmation = await devnetConnection.confirmTransaction(
-        {
-          signature,
-          blockhash: latest.blockhash,
-          lastValidBlockHeight: latest.lastValidBlockHeight,
-        },
-        'confirmed'
-      );
+      await assertRpcNetwork(rpcConnection, executionMode);
+      const solAmount = executionMode === 'LOCAL' ? 10 : 1;
+      const signature = await rpcConnection.requestAirdrop(target, solAmount * LAMPORTS_PER_SOL);
+      // Airdrop uses its own blockhash; do not confirm it with an unrelated one.
+      const confirmation = await rpcConnection.confirmTransaction(signature, 'confirmed');
       if (confirmation.value.err) {
         throw new Error(JSON.stringify(confirmation.value.err));
       }
       setStatusBanner(
-        `Airdrop 1 SOL devnet berhasil (${shortenAddress(target.toBase58(), 5)})`
+        `Airdrop ${executionMode === 'LOCAL' ? 10 : 1} SOL ${executionMode} berhasil (${shortenAddress(target.toBase58(), 5)})`
       );
-      await refreshSolBalance(devnetConnection, target);
+      await refreshSolBalance(rpcConnection, target);
     } catch (err) {
       setErrorMessage(
         `Airdrop gagal: ${
           err instanceof Error ? err.message : String(err)
-        }. Coba faucet.solana.com atau ganti VITE_RPC_ENDPOINT.`
+        }. Periksa jaringan dan faucet validator atau faucet devnet.`
       );
     } finally {
       setAirdropBusy(false);
@@ -1558,7 +1558,7 @@ export default function App(): React.ReactElement {
 
           <div className="flex flex-wrap items-center gap-2.5">
             <div role="group" aria-label="Pilih jaringan" className="inline-flex rounded-lg border border-zinc-800 bg-zinc-900 p-0.5 text-xs">
-              {(['SANDBOX', 'DEVNET', 'MAINNET'] as const).map((mode) => (
+              {(['SANDBOX', 'LOCAL', 'DEVNET', 'MAINNET'] as const).map((mode) => (
                 <button key={mode} type="button" aria-pressed={executionMode === mode}
                   disabled={isBusy || claimBusy || airdropBusy || walletBusy}
                   onClick={() => {
@@ -1572,7 +1572,7 @@ export default function App(): React.ReactElement {
                     }
                   }}
                   className={`rounded-md px-2.5 py-1 font-semibold transition disabled:opacity-50 ${executionMode === mode ? (mode === 'MAINNET' ? 'bg-rose-600 text-white' : 'bg-zinc-800 text-cyan-300') : 'text-zinc-400 hover:text-zinc-200'}`}>
-                  {mode === 'SANDBOX' ? 'Binary Sandbox' : mode === 'MAINNET' ? 'MAINNET' : 'Devnet'}
+                  {mode === 'SANDBOX' ? 'Binary Sandbox' : mode === 'LOCAL' ? 'Local Validator' : mode === 'MAINNET' ? 'MAINNET' : 'Devnet'}
                 </button>
               ))}
             </div>
@@ -1623,14 +1623,14 @@ export default function App(): React.ReactElement {
                 >
                   {solBalance === null ? '— SOL' : `${solBalance.toFixed(4)} SOL`}
                 </span>
-                {executionMode === 'DEVNET' && walletType !== 'INJECTED' && (
+                {(executionMode === 'LOCAL' || (executionMode === 'DEVNET' && walletType !== 'INJECTED')) && (
                   <button
                     type="button"
                     onClick={handleAirdrop}
                     disabled={airdropBusy || isBusy}
                     className="rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-2.5 py-1.5 text-xs font-medium text-cyan-300 transition hover:bg-cyan-500/20 disabled:cursor-not-allowed disabled:opacity-50"
                   >
-                    {airdropBusy ? 'Airdrop...' : 'Airdrop 1 SOL'}
+                    {airdropBusy ? 'Airdrop...' : executionMode === 'LOCAL' ? 'Airdrop 10 SOL lokal' : 'Airdrop 1 SOL'}
                   </button>
                 )}
               </div>
@@ -1641,11 +1641,12 @@ export default function App(): React.ReactElement {
 
       {executionMode !== 'SANDBOX' && (
         <div role="status" className={`mx-auto mt-3 max-w-6xl rounded-lg border px-4 py-3 text-xs ${executionMode === 'MAINNET' ? 'border-rose-500/60 bg-rose-950/50 text-rose-100' : 'border-cyan-500/40 bg-cyan-950/30 text-cyan-100'}`}>
-          <div className="font-bold">{executionMode === 'MAINNET' ? 'MAINNET — SOL NYATA, TRANSAKSI TIDAK DAPAT DIBATALKAN' : 'DEVNET — SOL UJI'}</div>
+          <div className="font-bold">{executionMode === 'MAINNET' ? 'MAINNET — SOL NYATA, TRANSAKSI TIDAK DAPAT DIBATALKAN' : executionMode === 'LOCAL' ? 'VALIDATOR LOKAL — SIMULASI, BUKAN MAINNET ASLI' : 'DEVNET — SOL UJI'}</div>
           <div>RPC: {rpcHost} · Program ID: <span className="break-all font-mono">{selectedProgramId?.toBase58() ?? 'belum dikonfigurasi'}</span></div>
           <div>{networkStatus?.key === networkKey ? networkStatus.message : 'Memeriksa jaringan…'}{' '}
             <button type="button" onClick={() => setNetworkRevision((n) => n + 1)} className="underline" disabled={isBusy || claimBusy}>Periksa ulang</button>
           </div>
+          {executionMode === 'LOCAL' && <p className="mt-1">SOL lokal tidak bernilai nyata. Hanya akun terpilih dikloning; ledger di-reset saat validator dimulai ulang. Hubungkan wallet ke jaringan lokal bila didukung. Jalankan dashboard dengan npm run dev:private dan lindungi port validator/faucet dengan firewall.</p>}
           {executionMode === 'MAINNET' && <>
             <p className="mt-1">Gunakan Phantom dengan jaringan mainnet. Pengecekan hanya memastikan RPC dan akun program, bukan audit, kecocokan binary, atau jaminan keamanan. Pool tidak memiliki remove liquidity.</p>
             <label className="mt-2 flex items-center gap-2"><input type="checkbox" checked={mainnetAcknowledged} disabled={isBusy || claimBusy} onChange={(e) => setMainnetAcknowledged(e.target.checked)} /> Saya memahami bahwa mainnet menggunakan dana nyata.</label>

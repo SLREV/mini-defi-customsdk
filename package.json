@@ -12,14 +12,16 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview --host 0.0.0.0 --port 4173",
     "typecheck": "tsc --noEmit",
-    "test": "tsx tests/verifySdk.ts && tsx tests/verifyPinata.ts && tsx tests/verifyPinataApi.ts && tsx tests/verifyClaimCreator.ts && tsx tests/verifyToolchain.ts && tsx tests/verifyTradeUtils.ts && tsx tests/verifyNetwork.ts",
+    "test": "tsx tests/verifySdk.ts && tsx tests/verifyPinata.ts && tsx tests/verifyPinataApi.ts && tsx tests/verifyClaimCreator.ts && tsx tests/verifyToolchain.ts && tsx tests/verifyTradeUtils.ts && tsx tests/verifyNetwork.ts && tsx tests/verifyLocalValidator.ts && tsx tests/verifyLocalProxy.ts",
     "anchor:build": "anchor build",
     "anchor:deploy": "anchor deploy --provider.cluster devnet",
     "toolchain:check": "tsx scripts/toolchainDoctor.ts",
     "devnet:check": "tsx scripts/devnetPreflight.ts",
     "pinata:upload": "tsx scripts/pinataUpload.ts",
     "pinata:check": "tsx scripts/pinataUpload.ts --check",
-    "claim:creator": "tsx --env-file-if-exists=.env scripts/claimCreatorFee.ts"
+    "claim:creator": "tsx --env-file-if-exists=.env scripts/claimCreatorFee.ts",
+    "dev:private": "vite --host 127.0.0.1 --port 5173",
+    "local:validator": "bash scripts/localValidator.sh"
   },
   "dependencies": {
     "@solana/buffer-layout": "^4.0.1",

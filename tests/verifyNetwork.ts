@@ -6,6 +6,8 @@ async function main(): Promise<void> {
   const program = Keypair.generate().publicKey;
   const fallback = Keypair.generate().publicKey;
   assert.equal(resolveProgramId('MAINNET', undefined, fallback), null);
+  assert(resolveProgramId('LOCAL', undefined, fallback)?.equals(fallback));
+  assert.equal(resolveProgramId('LOCAL', 'invalid!', fallback), null);
   assert.equal(resolveProgramId('MAINNET', 'invalid!', fallback), null);
   assert(resolveProgramId('MAINNET', program.toBase58(), fallback)?.equals(program));
   assert(resolveProgramId('DEVNET', undefined, fallback)?.equals(fallback));
@@ -25,6 +27,7 @@ async function main(): Promise<void> {
   await assert.rejects(assertRpcReady(rpc, 'MAINNET', null), /belum dikonfigurasi/);
   genesis = NETWORK_GENESIS.MAINNET;
   await assertRpcNetwork(rpc, 'MAINNET');
+  await assert.rejects(assertRpcNetwork(rpc, 'LOCAL'), /cluster publik/);
   await assert.rejects(assertRpcNetwork(rpc, 'DEVNET'), /bukan jaringan DEVNET/);
   account = null;
   await assert.rejects(assertRpcReady(rpc, 'MAINNET', program), /tidak ditemukan/);
@@ -32,6 +35,13 @@ async function main(): Promise<void> {
   await assert.rejects(assertRpcReady(rpc, 'MAINNET', program), /tidak executable/);
   account.executable = true;
   await assertRpcReady(rpc, 'MAINNET', program);
+  genesis = NETWORK_GENESIS.DEVNET;
+  await assert.rejects(assertRpcNetwork(rpc, 'LOCAL'), /cluster publik/);
+  genesis = '4uhcVJyU9pJkvQyS88uRDiswHXSCkY3z';
+  await assert.rejects(assertRpcNetwork(rpc, 'LOCAL'), /cluster publik/);
+  genesis = Keypair.generate().publicKey.toBase58();
+  await assertRpcReady(rpc, 'LOCAL', program);
+  await assert.rejects(assertRpcNetwork(rpc, 'MAINNET'), /bukan jaringan MAINNET/);
 
   const wallet = Keypair.generate().publicKey;
   const other = Keypair.generate().publicKey;
