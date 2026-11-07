@@ -1,7 +1,6 @@
 import {
   AccountMeta,
   Connection,
-  Keypair,
   PublicKey,
   SystemProgram,
   SYSVAR_RENT_PUBKEY,
@@ -14,34 +13,9 @@ import * as BufferLayout from '@solana/buffer-layout';
 // KONSTANTA PROGRAM SOLANA & TOKEN-2022 (MURNI TANPA SDK PIHAK KETIGA)
 // ============================================================================
 
-/**
- * Program ID AMM yang dipakai dashboard & seluruh script.
- *
- * Prioritas:
- *   1. `VITE_AMM_PROGRAM_ID` dari `.env` — dipakai bila Anda men-deploy ke
- *      program ID baru hasil `anchor keys sync` / build di folder tanpa
- *      `target/deploy/mini_amm-keypair.json`.
- *   2. Fallback default di bawah.
- *
- * `npm run toolchain:check` membandingkan nilai ini dengan `declare_id!` di
- * `programs/mini-amm/src/lib.rs` dan pubkey di
- * `target/deploy/mini_amm-keypair.json`, lalu menandai bila tidak cocok.
- */
-function readProgramIdOverride(): string | undefined {
-  // Vite mengganti `import.meta.env` saat build browser.
-  // Di Node (tsx/CLI) `import.meta.env` tidak ada -> pakai process.env.
-  const fromVite = (
-    import.meta.env as { VITE_AMM_PROGRAM_ID?: string } | undefined
-  )?.VITE_AMM_PROGRAM_ID;
-  const fromNode =
-    typeof process !== 'undefined' ? process.env.VITE_AMM_PROGRAM_ID : undefined;
-  return (fromVite ?? fromNode)?.trim();
-}
-
-const AMM_PROGRAM_ID_OVERRIDE = readProgramIdOverride();
-
+/** SDK default for callers that do not configure a program. The mainnet UI requires an explicit ID. */
 export const DEFAULT_AMM_PROGRAM_ID = new PublicKey(
-  AMM_PROGRAM_ID_OVERRIDE || 'DnW4iMWC5gCjPZkk2kkdTrY5uybW3w6r6aLdS6meynMn'
+  'DnW4iMWC5gCjPZkk2kkdTrY5uybW3w6r6aLdS6meynMn'
 );
 
 /** SPL Token Legacy Program (digunakan oleh WSOL & USDC lama) */
@@ -444,7 +418,7 @@ export interface OffchainTokenMetadataJson {
 
 export interface CloneTokenParams {
   payer: PublicKey;
-  mintKeypair?: Keypair;
+  mint: PublicKey;
   name: string;
   symbol: string;
   imageUri: string;
@@ -466,7 +440,6 @@ export interface CloneTokenParams {
 }
 
 export interface CloneTokenBuildResult {
-  mintKeypair: Keypair;
   mint: PublicKey;
   tokenProgramId: PublicKey;
   tokenStandard: TokenStandardMode;
@@ -1241,8 +1214,7 @@ export class CustomDefiSDK {
   public async buildCloneTokenInstructions(
     params: CloneTokenParams
   ): Promise<CloneTokenBuildResult> {
-    const mintKeypair = params.mintKeypair ?? Keypair.generate();
-    const mint = mintKeypair.publicKey;
+    const mint = params.mint;
     const decimals = params.decimals ?? DEFAULT_TOKEN_DECIMALS;
     const tokenStandard: TokenStandardMode = params.tokenStandard ?? 'TOKEN_2022';
     if (tokenStandard !== 'TOKEN_2022' && params.authorities) {
@@ -1379,7 +1351,6 @@ export class CustomDefiSDK {
       }
 
       return {
-        mintKeypair,
         mint,
         tokenProgramId,
         tokenStandard,
@@ -1446,7 +1417,6 @@ export class CustomDefiSDK {
     }
 
     return {
-      mintKeypair,
       mint,
       tokenProgramId,
       tokenStandard,

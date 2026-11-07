@@ -1,2294 +1,274 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { formatExactTokenAmount, readSwapTokenBalance } from './tradeUtils';
-import { assertMainnetWallet, assertRpcNetwork, assertRpcReady, ExecutionMode, resolveProgramId } from './network';
+import { useConnection, useWallet } from '@solana/wallet-adapter-react';
+import { PhantomWalletName } from '@solana/wallet-adapter-phantom';
+import { ComputeBudgetProgram, Keypair, PublicKey, Transaction } from '@solana/web3.js';
 import {
-  AccountInfo,
-  Commitment,
-  ComputeBudgetProgram,
-  Connection,
-  Keypair,
-  LAMPORTS_PER_SOL,
-  PublicKey,
-  SystemProgram,
-  Transaction,
-  TransactionInstruction,
-} from '@solana/web3.js';
-import {
-  ASSOCIATED_TOKEN_PROGRAM_ID,
-  CustomDefiSDK,
-  DEFAULT_AMM_PROGRAM_ID,
-  DEFAULT_TOKEN_DECIMALS,
-  DeserializedPoolInfo,
-  NATIVE_SOL_MINT,
-  POOL_STATE_DISCRIMINATOR,
-  POOL_STATE_SIZE,
-  PoolStateLayout,
-  SPL_MINT_ACCOUNT_LAYOUT,
-  SPL_MINT_SIZE,
-  SPL_TOKEN_ACCOUNT_LAYOUT,
-  SDK_BUILD_TAG,
-  SPL_TOKEN_ACCOUNT_SIZE,
-  TOKEN_2022_PROGRAM_ID,
-  TOKEN_PROGRAM_ID,
-  TokenStandardMode,
-  calculateCreatorFee,
-  calculateSwapOutput,
-  formatTokenAmount,
-  parseTokenAmount,
+  CustomDefiSDK, DeserializedPoolInfo, NATIVE_SOL_MINT, TOKEN_2022_PROGRAM_ID,
+  TOKEN_PROGRAM_ID, calculateSwapOutput, parseTokenAmount,
 } from './sdk/customSdk';
+import { formatExactTokenAmount, readSwapTokenBalance } from './tradeUtils';
+import { assertMainnet, launchRentAccountSizes, sendMainnetTransaction } from './mainnet';
 
-interface InjectedSolanaProvider {
-  isPhantom?: boolean;
-  publicKey?: PublicKey;
-  connect: () => Promise<{ publicKey: PublicKey }>;
-  disconnect: () => Promise<void>;
-  signTransaction: (tx: Transaction) => Promise<Transaction>;
-}
+const label = 'mb-1 block text-xs font-medium text-zinc-300';
+const input = 'w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-100';
+const button = 'rounded-lg bg-emerald-500 px-4 py-2 text-sm font-semibold text-zinc-950 disabled:cursor-not-allowed disabled:opacity-40';
+const card = 'rounded-xl border border-zinc-800 bg-zinc-900/60 p-5';
+const computeUnits = 1_400_000;
 
-declare global {
-  interface Window {
-    solana?: InjectedSolanaProvider;
-  }
-}
-
-type LaunchStage =
-  | 'IDLE'
-  | 'MINTING_TOKEN'
-  | 'INITIALIZING_POOL'
-  | 'INITIAL_SWAP'
-  | 'FETCHING_POOL'
-  | 'SWAPPING'
-  | 'SUCCESS'
-  | 'ERROR';
-
-interface PipelineStepLog {
-  step: number;
-  label: string;
-  status: 'pending' | 'active' | 'done' | 'error';
-  detail?: string;
-}
-
-interface BinaryTelemetry {
-  mintAddress: string;
-  tokenStandard: TokenStandardMode;
-  tokenProgramY: string;
-  allocatedMintBytes: number;
-  additionalMetadata: [string, string][];
-  createPoolIxHex: string;
-  lastSwapIxHex?: string;
-  cloneIxCount: number;
-}
-
-/**
- * Endpoint RPC devnet. Bisa dioverride lewat `.env` (VITE_RPC_ENDPOINT) bila RPC publik
- * kena rate-limit (mis. Helius/QuickNode devnet).
- */
-const DEVNET_RPC_ENDPOINT =
-  (import.meta.env.VITE_RPC_ENDPOINT as string | undefined)?.trim() ||
-  'https://api.devnet.solana.com';
-
-const MAINNET_RPC_ENDPOINT =
-  (import.meta.env.VITE_MAINNET_RPC_ENDPOINT as string | undefined)?.trim() ||
-  'https://api.mainnet-beta.solana.com';
-
-const MAINNET_AMM_PROGRAM_ID = resolveProgramId('MAINNET', import.meta.env.VITE_MAINNET_AMM_PROGRAM_ID as string | undefined, DEFAULT_AMM_PROGRAM_ID);
-const DEVNET_AMM_PROGRAM_ID = resolveProgramId('DEVNET', import.meta.env.VITE_DEVNET_AMM_PROGRAM_ID as string | undefined, DEFAULT_AMM_PROGRAM_ID);
-
-const DEVNET_RPC_HOST = ((): string => {
+function configuredProgramId(): PublicKey | null {
   try {
-    return new URL(DEVNET_RPC_ENDPOINT).host;
-  } catch {
-    return DEVNET_RPC_ENDPOINT;
-  }
-})();
-
-/** Batas minimum SOL agar pipeline devnet tidak gagal di tengah jalan. */
-const MIN_DEVNET_SOL = 0.05;
-
-/**
- * Compute unit limit eksplisit: transaksi mint Token-2022 mengalokasikan TLV metadata
- * (+ realloc) plus 8 instruksi, sehingga bisa melewati default 200k CU di devnet.
- */
-const CLONE_TX_COMPUTE_UNITS = 600_000;
-const AMM_TX_COMPUTE_UNITS = 300_000;
-
-const withComputeBudget = (tx: Transaction, units: number): Transaction => {
-  const rebuilt = new Transaction().add(
-    ComputeBudgetProgram.setComputeUnitLimit({ units }),
-    ...tx.instructions
-  );
-  rebuilt.feePayer = tx.feePayer;
-  rebuilt.recentBlockhash = tx.recentBlockhash;
-  return rebuilt;
-};
-
-/** Terjemahkan error RPC/preflight menjadi pesan yang bisa ditindaklanjuti. */
-const describeRpcError = (err: unknown, rpcEndpoint: string, programId: PublicKey): string => {
-  try { rpcEndpoint = new URL(rpcEndpoint).host; } catch { rpcEndpoint = 'RPC'; }
-  const logs =
-    typeof err === 'object' && err !== null && 'logs' in err
-      ? ((err as { logs?: string[] | null }).logs ?? null)
-      : null;
-  const raw = err instanceof Error ? err.message : String(err);
-  const haystack = `${raw} ${(logs ?? []).join(' ')}`;
-
-  if (
-    /Attempt to load a program that does not exist|InvalidProgramId|UnsupportedProgramId|program that does not exist/i.test(
-      haystack
-    )
-  ) {
-    return `Program AMM ${programId.toBase58()} tidak tersedia di ${rpcEndpoint}. Periksa jaringan dan deployment sebelum transaksi.`;
-  }
-  // Anchor ErrorCode 4100 / custom error 0x1004: binary yang ter-deploy
-  // dikompilasi dengan declare_id! berbeda dari alamat tempat ia di-deploy.
-  // Setiap instruksi ditolak di entrypoint, jadi pesannya harus sangat jelas.
-  if (/DeclaredProgramIdMismatch|0x1004/i.test(haystack)) {
-    const failedIx = raw.match(/Error processing Instruction (\d+)/i)?.[1];
-    const tail = logs && logs.length > 0 ? `\nLog: ${logs.slice(-2).join(' | ')}` : '';
-    return [
-      `Instruksi ${failedIx ?? '?'} gagal: DeclaredProgramIdMismatch (Anchor 4100 / 0x1004).`,
-      `Program di ${programId.toBase58()} dikompilasi untuk program ID yang berbeda,`,
-      'jadi Anchor menolak semua instruksi di entrypoint.',
-      'Periksa kesesuaian declare_id!, program ID dan binary yang di-deploy sebelum melanjutkan.',
-    ].join(' ') + tail;
-  }
-  if (/insufficient (funds|lamports)|InsufficientFundsForRent|0x1/i.test(haystack)) {
-    return `Saldo SOL wallet tidak cukup untuk fee/rent di ${rpcEndpoint}. Di devnet klik "Airdrop 1 SOL" atau pakai faucet.solana.com.`;
-  }
-  if (/Blockhash not found|block height exceeded|BlockhashNotFound/i.test(haystack)) {
-    return 'Blockhash transaksi kedaluwarsa. Coba kirim ulang (pipeline akan mengambil blockhash baru).';
-  }
-  if (/429|Too Many Requests|rate.?limit|-32429/i.test(haystack)) {
-    return `RPC ${rpcEndpoint} menolak karena rate-limit. Gunakan RPC lain untuk jaringan yang sama.`;
-  }
-  if (/User rejected|rejected the request/i.test(haystack)) {
-    return 'Transaksi ditolak di wallet.';
-  }
-  if (
-    /UninitializedAccount|instruction requires an initialized account|AccountNotInitialized/i.test(
-      haystack
-    )
-  ) {
-    const failedIx = raw.match(/Error processing Instruction (\d+)/i)?.[1];
-    const tail = logs && logs.length > 0 ? `\nLog: ${logs.slice(-2).join(' | ')}` : '';
-    return `Instruksi ${failedIx ?? '?'} gagal: ada akun token (mint / ATA / vault) yang belum terinisialisasi — cek urutan CreateIdempotent ATA sebelum MintTo/TransferChecked.${tail}`;
-  }
-  return logs && logs.length > 0 ? `${raw}\nLog: ${logs.slice(-3).join(' | ')}` : raw;
-};
-
-const programLabel = (ix: TransactionInstruction): string => {
-  const id = ix.programId;
-  if (id.equals(TOKEN_2022_PROGRAM_ID)) return 'Token-2022';
-  if (id.equals(TOKEN_PROGRAM_ID)) return 'SPL Token';
-  if (id.equals(ASSOCIATED_TOKEN_PROGRAM_ID)) return 'ATA';
-  if (id.equals(SystemProgram.programId)) return 'System';
-  if (id.equals(ComputeBudgetProgram.programId)) return 'ComputeBudget';
-  return id.toBase58().slice(0, 8) + '…';
-};
-
-/** Cetak ringkasan layout transaksi ke console (bantu debugging instruksi mana yang gagal). */
-const logTxLayout = (
-  label: string,
-  instructions: TransactionInstruction[]
-): void => {
-  console.info(`[${label}] ${instructions.length} instruksi — build ${SDK_BUILD_TAG}`);
-  console.table(
-    instructions.map((ix, i) => ({
-      '#': i,
-      program: programLabel(ix),
-      akun: ix.keys.length,
-      tag: ix.data.length > 0 ? ix.data[0] : -1,
-      bytes: ix.data.byteLength,
-    }))
-  );
-};
-
-/**
- * Penjaga layout `MintToChecked` (ix `u8 = 14`).
- *
- * Versi SDK lama mengirim 4 `AccountMeta` `[mint, mint, destination, authority]`
- * (layout `TransferChecked`). Akibatnya Token-2022 membaca akun **Mint** sebagai
- * `destination` dan transaksi gagal di preflight dengan
- * `Error processing Instruction 8: instruction requires an initialized account`.
- * Guard ini mengubah kegagalan simulasi yang membingungkan menjadi pesan yang jelas.
- */
-const assertMintToCheckedLayout = (
-  instructions: TransactionInstruction[],
-  expectedDestination: PublicKey
-): void => {
-  instructions.forEach((ix, index) => {
-    if (ix.data.length === 0 || ix.data[0] !== 14) return;
-    const destination = ix.keys[1]?.pubkey;
-    if (ix.keys.length !== 3 || !destination || !destination.equals(expectedDestination)) {
-      throw new Error(
-        `Layout MintToChecked salah di instruksi #${index}: ${ix.keys.length} akun (harus 3 = [mint, destination ATA, mint_authority]). ` +
-          'Kode yang berjalan masih versi lama — jalankan "git pull" di folder proyek, restart "npm run dev", lalu hard reload browser (Ctrl+Shift+R).'
-      );
-    }
-  });
-};
-
-class SandboxBinaryConnection extends Connection {
-  private readonly accounts = new Map<string, AccountInfo<Buffer>>();
-
-  constructor() {
-    super(DEVNET_RPC_ENDPOINT, 'confirmed');
-  }
-
-  public writeRawAccount(pubkey: PublicKey, info: AccountInfo<Buffer>): void {
-    this.accounts.set(pubkey.toBase58(), info);
-  }
-
-  public override async getMinimumBalanceForRentExemption(
-    dataLength: number
-  ): Promise<number> {
-    return (128 + dataLength) * 6960;
-  }
-
-  public override async getLatestBlockhash(): Promise<{
-    blockhash: string;
-    lastValidBlockHeight: number;
-  }> {
-    return {
-      blockhash: Keypair.generate().publicKey.toBase58(),
-      lastValidBlockHeight: 320_000_000,
-    };
-  }
-
-  public override async getAccountInfo(
-    publicKey: PublicKey,
-    _commitmentOrConfig?: Commitment
-  ): Promise<AccountInfo<Buffer> | null> {
-    return this.accounts.get(publicKey.toBase58()) ?? null;
-  }
-
-  public override async getMultipleAccountsInfo(
-    publicKeys: PublicKey[],
-    _commitmentOrConfig?: Commitment
-  ): Promise<(AccountInfo<Buffer> | null)[]> {
-    return publicKeys.map((pk) => this.accounts.get(pk.toBase58()) ?? null);
-  }
+    const value = (import.meta.env.VITE_MAINNET_AMM_PROGRAM_ID as string | undefined)?.trim();
+    return value ? new PublicKey(value) : null;
+  } catch { return null; }
 }
-
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
-const shortenAddress = (addr: string, chars = 6): string =>
-  addr.length <= chars * 2 + 3
-    ? addr
-    : `${addr.slice(0, chars)}...${addr.slice(-chars)}`;
 
 export default function App(): React.ReactElement {
-  // Cluster & Wallet State
-  const [executionMode, setExecutionMode] = useState<ExecutionMode>(
-    'SANDBOX'
-  );
-  const [walletPubkey, setWalletPubkey] = useState<PublicKey | null>(null);
-  const [walletType, setWalletType] = useState<'INJECTED' | 'EPHEMERAL' | null>(
-    null
-  );
-  const [ephemeralKeypair] = useState<Keypair>(() => Keypair.generate());
-
-  // Unified Token-2022 + Virtual Liquidity Form State
-  const [tokenStandard, setTokenStandard] =
-    useState<TokenStandardMode>('TOKEN_2022');
-  const [tokenName, setTokenName] = useState<string>('Nusantara Token 2022');
-  const [ticker, setTicker] = useState<string>('NUSA');
-  // Defaults are OFF for newly created Token-2022 mints; revocation is permanent.
-  const [authoritySettings, setAuthoritySettings] = useState({ mint: false, freeze: false, metadata: false });
-  const [authorityAcknowledged, setAuthorityAcknowledged] = useState(false);
-  const [imageUri, setImageUri] = useState<string>(
-    'https://ipfs.io/ipfs/bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy'
-  );
-  // URI JSON metadata (mis. hasil `npm run pinata:upload`); opsional.
-  const [metadataUri, setMetadataUri] = useState<string>('');
-
-  // Upload gambar ke IPFS lewat dev API `/api/pinata/upload` (khusus `npm run dev`).
-  const [pinataUploadBusy, setPinataUploadBusy] = useState<boolean>(false);
-  const [pinataUploadError, setPinataUploadError] = useState<string | null>(null);
-  const [pinataStatus, setPinataStatus] = useState<{
-    configured: boolean;
-    message: string;
-  } | null>(null);
-  const [telegram, setTelegram] = useState<string>('https://t.me/nusa_2022');
-  const [twitter, setTwitter] = useState<string>('https://x.com/nusa_2022');
-  const [totalSupply, setTotalSupply] = useState<string>('1000000000');
-  const [virtualSolLiquidity, setVirtualSolLiquidity] = useState<string>('30');
-  const [initialBuySol, setInitialBuySol] = useState<string>('0');
-
-  // Execution & Deserialized Pool State
-  const [stage, setStage] = useState<LaunchStage>('IDLE');
-  const [statusBanner, setStatusBanner] = useState<string>(
-    'Siap — Luncurkan Token-2022 (MetadataPointer + On-Chain Socials) & Virtual Liquidity AMM'
-  );
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [claimBusy, setClaimBusy] = useState<boolean>(false);
-  const [steps, setSteps] = useState<PipelineStepLog[]>([
-    {
-      step: 1,
-      label: 'Clone Token-2022 + Native MetadataPointer & On-Chain Fields',
-      status: 'pending',
-    },
-    {
-      step: 2,
-      label: 'Initialize Virtual Liquidity Pool (transfer_checked 100% Supply)',
-      status: 'pending',
-    },
-    {
-      step: 3,
-      label: 'Initial SOL Swap (Opsional pada Detik ke-0)',
-      status: 'pending',
-    },
-    {
-      step: 4,
-      label: 'Fetch & Unpack 281-Byte PoolState + Vaults + Fee Vault',
-      status: 'pending',
-    },
-  ]);
-
-  const [poolInfo, setPoolInfo] = useState<DeserializedPoolInfo | null>(null);
-  const [sandboxTokenBalanceRaw, setSandboxTokenBalanceRaw] = useState<bigint>(0n);
-  const [sandboxOwner, setSandboxOwner] = useState<string | null>(null);
-  const [poolMode, setPoolMode] = useState<ExecutionMode | null>(null);
-  const [devnetBalance, setDevnetBalance] = useState<{ key: string; amount: bigint } | null>(null);
-  const [balanceError, setBalanceError] = useState<string | null>(null);
-  const [balanceBusy, setBalanceBusy] = useState(false);
-  const [balanceRevision, setBalanceRevision] = useState(0);
-  const [copyStatus, setCopyStatus] = useState('');
-  const balanceRequest = useRef(0);
-  const [telemetry, setTelemetry] = useState<BinaryTelemetry | null>(null);
-
-  // Status devnet: saldo SOL wallet & proses airdrop
-  const [solBalance, setSolBalance] = useState<number | null>(null);
-  const [airdropBusy, setAirdropBusy] = useState<boolean>(false);
-  const [walletBusy, setWalletBusy] = useState(false);
-  const [mainnetAcknowledged, setMainnetAcknowledged] = useState(false);
+  const { connection } = useConnection();
+  const { publicKey, connected, connecting, wallet, select, connect, disconnect, sendTransaction } = useWallet();
+  const programId = useMemo(configuredProgramId, []);
+  const sdk = useMemo(() => programId ? new CustomDefiSDK(connection, programId) : null, [connection, programId]);
+  const [networkStatus, setNetworkStatus] = useState('Memeriksa RPC dan program…');
+  const [networkReady, setNetworkReady] = useState(false);
   const [networkRevision, setNetworkRevision] = useState(0);
-  const [networkStatus, setNetworkStatus] = useState<{ key: string; state: 'checking' | 'ready' | 'error'; message: string } | null>(null);
+  const [balance, setBalance] = useState<number | null>(null);
+  const [balanceRevision, setBalanceRevision] = useState(0);
+  const [error, setError] = useState('');
+  const [status, setStatus] = useState('Hubungkan Phantom untuk menggunakan mainnet.');
+  const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
+  const beginAction = (): boolean => {
+    if (busyRef.current) return false;
+    busyRef.current = true; setBusy(true); return true;
+  };
+  const endAction = (): void => { busyRef.current = false; setBusy(false); };
+  const [signature, setSignature] = useState('');
+  const [riskAccepted, setRiskAccepted] = useState(false);
+  const [authorityAcknowledged, setAuthorityAcknowledged] = useState(false);
+  const [authority, setAuthority] = useState({ mint: false, freeze: false, metadata: false });
+  const [name, setName] = useState('');
+  const [symbol, setSymbol] = useState('');
+  const [imageUri, setImageUri] = useState('');
+  const [metadataUri, setMetadataUri] = useState('');
+  const [telegram, setTelegram] = useState('');
+  const [twitter, setTwitter] = useState('');
+  const [supply, setSupply] = useState('1000000000');
+  const [virtualSol, setVirtualSol] = useState('30');
+  const [uploadBusy, setUploadBusy] = useState(false);
+  const [pool, setPool] = useState<DeserializedPoolInfo | null>(null);
+  const [mintInput, setMintInput] = useState('');
+  const [tokenBalance, setTokenBalance] = useState<bigint | null>(null);
+  const [side, setSide] = useState<'BUY' | 'SELL'>('BUY');
+  const [amount, setAmount] = useState('');
+  const [slippage, setSlippage] = useState('1');
+  const [copyStatus, setCopyStatus] = useState('');
 
-  // Interactive Swap Terminal State
-  const [tradeSide, setTradeSide] = useState<'BUY' | 'SELL'>('BUY');
-  const [tradeAmountInput, setTradeAmountInput] = useState<string>('5');
-
-  const sandboxConnection = useMemo(() => new SandboxBinaryConnection(), []);
-  const devnetConnection = useMemo(
-    () => new Connection(DEVNET_RPC_ENDPOINT, 'confirmed'),
-    []
-  );
-
-  const mainnetConnection = useMemo(
-    () => new Connection(MAINNET_RPC_ENDPOINT, 'confirmed'), []
-  );
-  const rpcConnection = executionMode === 'MAINNET' ? mainnetConnection : devnetConnection;
-  const selectedProgramId = executionMode === 'MAINNET' ? MAINNET_AMM_PROGRAM_ID
-    : executionMode === 'DEVNET' ? DEVNET_AMM_PROGRAM_ID : DEFAULT_AMM_PROGRAM_ID;
-  const networkKey = `${executionMode}:${rpcConnection.rpcEndpoint}:${selectedProgramId?.toBase58() ?? ''}`;
-  const rpcReady = executionMode === 'SANDBOX' || (networkStatus?.key === networkKey && networkStatus.state === 'ready');
-  const operationAllowed = rpcReady && (executionMode !== 'MAINNET' ||
-    (mainnetAcknowledged && walletType === 'INJECTED' && walletPubkey !== null));
-  const rpcHost = executionMode === 'MAINNET'
-    ? (() => { try { return new URL(MAINNET_RPC_ENDPOINT).host; } catch { return 'RPC'; } })()
-    : DEVNET_RPC_HOST;
-
+  useEffect(() => { if (!wallet) select(PhantomWalletName); }, [wallet, select]);
   useEffect(() => {
-    if (executionMode === 'SANDBOX') return;
     let cancelled = false;
-    setNetworkStatus({ key: networkKey, state: 'checking', message: 'Memeriksa jaringan dan program…' });
-    void assertRpcReady(rpcConnection, executionMode, selectedProgramId)
-      .then(() => {
-        if (!cancelled) setNetworkStatus({ key: networkKey, state: 'ready', message: 'Jaringan dan program terdeteksi.' });
-      })
-      .catch((err: unknown) => {
-        if (!cancelled) setNetworkStatus({ key: networkKey, state: 'error', message: err instanceof Error ? err.message : 'Pemeriksaan RPC gagal.' });
-      });
-    return () => { cancelled = true; };
-  }, [executionMode, networkKey, networkRevision, rpcConnection, selectedProgramId]);
-
-  const assertCurrentNetwork = async (): Promise<void> => {
-    if (executionMode === 'SANDBOX') return;
-    if (executionMode === 'MAINNET' && (!mainnetAcknowledged || walletType !== 'INJECTED' || !walletPubkey)) {
-      throw new Error('Mainnet memerlukan wallet Phantom dan persetujuan risiko mainnet.');
+    setNetworkReady(false);
+    if (!programId) {
+      setNetworkStatus('Isi VITE_MAINNET_AMM_PROGRAM_ID dengan program AMM yang sudah di-deploy di mainnet.');
+      return;
     }
-    await assertRpcReady(rpcConnection, executionMode, selectedProgramId);
+    setNetworkStatus('Memeriksa RPC dan program…');
+    void assertMainnet(connection, programId).then(() => {
+      if (!cancelled) { setNetworkReady(true); setNetworkStatus('Mainnet dan akun program executable terdeteksi. Binary belum diverifikasi oleh dashboard.'); }
+    }).catch((err: unknown) => { if (!cancelled) setNetworkStatus(err instanceof Error ? err.message : 'Pemeriksaan mainnet gagal'); });
+    return () => { cancelled = true; };
+  }, [connection, programId, networkRevision]);
+  useEffect(() => {
+    let cancelled = false;
+    setBalance(null);
+    if (publicKey && networkReady) void connection.getBalance(publicKey, 'confirmed')
+      .then((value) => { if (!cancelled) setBalance(value); })
+      .catch(() => { if (!cancelled) setBalance(null); });
+    return () => { cancelled = true; };
+  }, [publicKey, connection, networkReady, balanceRevision]);
+  useEffect(() => {
+    let cancelled = false;
+    setTokenBalance(null);
+    if (pool && publicKey && networkReady) void readSwapTokenBalance(connection, publicKey, pool.tokenY, pool.tokenProgramY)
+      .then((value) => { if (!cancelled) setTokenBalance(value); })
+      .catch(() => { if (!cancelled) setTokenBalance(null); });
+    return () => { cancelled = true; };
+  }, [pool, publicKey, connection, networkReady, balanceRevision]);
+  useEffect(() => { setRiskAccepted(false); setPool(null); setSignature(''); }, [publicKey]);
+
+  const report = (err: unknown) => setError(err instanceof Error ? err.message : String(err));
+  const activePayer = (): PublicKey => {
+    if (!publicKey || !connected || !wallet?.adapter.publicKey?.equals(publicKey)) throw new Error('Hubungkan wallet Phantom yang benar.');
+    if (!riskAccepted) throw new Error('Konfirmasi risiko mainnet terlebih dahulu.');
+    if (!sdk || !programId || !networkReady) throw new Error('RPC atau program mainnet belum siap.');
+    return publicKey;
   };
 
-  const activeOwner = walletPubkey ?? ephemeralKeypair.publicKey;
-  const balanceKey = poolInfo
-    ? `${executionMode}:${activeOwner.toBase58()}:${poolInfo.tokenY.toBase58()}:${poolInfo.tokenProgramY.toBase58()}`
-    : '';
-  const currentBalanceKey = useRef(balanceKey);
-  currentBalanceKey.current = balanceKey;
-  const userTokenBalanceRaw = poolMode !== executionMode ? null
-    : executionMode === 'SANDBOX'
-      ? (sandboxOwner === activeOwner.toBase58() ? sandboxTokenBalanceRaw : 0n)
-      : (devnetBalance?.key === balanceKey ? devnetBalance.amount : null);
+  // Only the wallet adapter signs and sends. mintKeypair is an additional, ephemeral
+  // signer solely for the new mint account; the SDK never receives secret keys.
+  const dispatch = async (tx: Transaction, signers: Keypair[], sizes: number[], transfer = 0n): Promise<string> => {
+    const payer = activePayer();
+    const result = await sendMainnetTransaction(connection, programId!, payer, tx, signers, sizes, transfer, sendTransaction,
+      () => { if (!wallet?.adapter.publicKey?.equals(payer)) throw new Error('Wallet berubah. Hubungkan ulang.'); },
+      (required) => setStatus(`Estimasi minimum ${(Number(required) / 1e9).toFixed(6)} SOL termasuk cadangan. Menunggu persetujuan wallet…`),
+      (sent) => { setSignature(sent); setStatus(`Transaksi ${sent} dikirim; menunggu konfirmasi…`); },
+    );
+    setBalanceRevision((n) => n + 1);
+    return result;
+  };
 
-  // Refresh the on-chain ATA after launch, swap, claim, or wallet/mode changes.
-  useEffect(() => {
-    const request = ++balanceRequest.current;
-    if (!poolInfo || executionMode === 'SANDBOX' || poolMode !== executionMode || !rpcReady) {
-      setBalanceBusy(false);
-      setBalanceError(null);
-      return;
-    }
-    let cancelled = false;
-    setDevnetBalance(null);
-    setBalanceError(null);
-    setBalanceBusy(true);
-    void readSwapTokenBalance(rpcConnection, activeOwner, poolInfo.tokenY, poolInfo.tokenProgramY)
-      .then((amount) => {
-        if (!cancelled && request === balanceRequest.current) setDevnetBalance({ key: balanceKey, amount });
-      })
-      .catch((err: unknown) => {
-        if (!cancelled && request === balanceRequest.current) {
-          setBalanceError(err instanceof Error ? err.message : 'Gagal membaca saldo token');
-        }
-      })
-      .finally(() => {
-        if (!cancelled && request === balanceRequest.current) setBalanceBusy(false);
-      });
-    return () => { cancelled = true; };
-  // Key includes the owner, mint and token program; reserves updates do not require a read.
-  }, [balanceKey, balanceRevision, rpcConnection, poolMode, rpcReady]);
-
-  const handleSellAll = async (): Promise<void> => {
-    if (!poolInfo || poolMode !== executionMode || !rpcReady) return;
-    setTradeSide('SELL');
-    setTradeAmountInput('');
-    setErrorMessage(null);
-    if (executionMode === 'SANDBOX') {
-      setTradeAmountInput(formatExactTokenAmount(userTokenBalanceRaw ?? 0n));
-      return;
-    }
-    const key = balanceKey;
-    const request = ++balanceRequest.current;
-    setBalanceBusy(true);
-    setBalanceError(null);
-    setDevnetBalance(null);
+  const launch = async (event: React.FormEvent): Promise<void> => {
+    event.preventDefault(); if (!beginAction()) return; setError(''); setSignature(''); setPool(null);
+    let attemptedMint = '';
     try {
-      const amount = await readSwapTokenBalance(rpcConnection, activeOwner, poolInfo.tokenY, poolInfo.tokenProgramY);
-      if (request !== balanceRequest.current || key !== currentBalanceKey.current) return;
-      setDevnetBalance({ key, amount });
-      setTradeAmountInput(formatExactTokenAmount(amount));
+      const payer = activePayer();
+      if ((!authority.mint || !authority.freeze || !authority.metadata) && !authorityAcknowledged) {
+        throw new Error('Konfirmasi bahwa authority OFF bersifat permanen.');
+      }
+      const total = parseTokenAmount(supply, 9);
+      const virtualX = parseTokenAmount(virtualSol, 9);
+      if (total <= 0n || virtualX <= 0n) throw new Error('Supply dan virtual SOL harus lebih besar dari nol.');
+      await assertMainnet(connection, programId!);
+      const mintKeypair = Keypair.generate();
+      const mint = await sdk!.buildCloneTokenInstructions({
+        mint: mintKeypair.publicKey, payer, name, symbol, imageUri, metadataUri: metadataUri.trim() || undefined,
+        telegram, twitter, decimals: 9, initialSupplyRaw: total, tokenStandard: 'TOKEN_2022', authorities: authority,
+      });
+      const poolBuild = await sdk!.buildCreatePoolTx({
+        payer, tokenX: NATIVE_SOL_MINT, tokenY: mint.mint, initialRealTokenY: total, virtualReservesX: virtualX,
+        tokenProgramX: TOKEN_PROGRAM_ID, tokenProgramY: TOKEN_2022_PROGRAM_ID, tokenProgramLp: TOKEN_2022_PROGRAM_ID,
+      });
+      // Mint instructions already create the same associated token account.
+      const tx = new Transaction().add(ComputeBudgetProgram.setComputeUnitLimit({ units: computeUnits }), ...mint.instructions, poolBuild.instruction);
+      attemptedMint = mint.mint.toBase58();
+      setMintInput(attemptedMint);
+      await dispatch(tx, [mintKeypair], launchRentAccountSizes(mint.allocatedMintBytes));
+      setStatus(`Mint dan pool terkonfirmasi di mainnet: ${attemptedMint}`);
+      try { setPool(await sdk!.fetchPoolInfo(poolBuild.addresses.poolState)); }
+      catch { setStatus(`Transaksi terkonfirmasi. Gagal membaca pool; muat ulang menggunakan mint ${attemptedMint}.`); }
     } catch (err) {
-      if (request === balanceRequest.current && key === currentBalanceKey.current) {
-        setBalanceError(err instanceof Error ? err.message : 'Gagal membaca saldo token');
-      }
-    } finally {
-      if (request === balanceRequest.current && key === currentBalanceKey.current) setBalanceBusy(false);
-    }
+      const detail = err instanceof Error ? err.message : String(err);
+      setError(attemptedMint ? `${detail} Mint yang dicoba: ${attemptedMint}. Periksa status sebelum mengulang.` : detail);
+    } finally { endAction(); }
   };
 
-  const handleCopyMint = async (): Promise<void> => {
-    if (!poolInfo) return;
+  const loadPool = async (): Promise<void> => {
+    if (!beginAction()) return; setError('');
     try {
-      await navigator.clipboard.writeText(poolInfo.tokenY.toBase58());
-      setCopyStatus('Mint disalin');
-    } catch {
-      setCopyStatus('Gagal menyalin. Pilih dan salin alamat secara manual.');
-    }
+      if (!sdk || !programId || !networkReady) throw new Error('Program mainnet belum siap.');
+      await assertMainnet(connection, programId);
+      const info = await sdk.fetchPoolInfo(NATIVE_SOL_MINT, new PublicKey(mintInput.trim()));
+      const mintAccount = await connection.getAccountInfo(info.tokenY, 'confirmed');
+      if (!mintAccount || !mintAccount.owner.equals(info.tokenProgramY) || mintAccount.data.length < 82 || mintAccount.data[44] !== 9) throw new Error('Dashboard hanya mendukung mint token dengan 9 desimal.');
+      setPool(info); setStatus(`Pool ${info.poolAddress.toBase58()} dimuat dari mainnet.`);
+    } catch (err) { report(err); } finally { endAction(); }
   };
 
-  const readSolBalance = async (
-    conn: Connection,
-    pubkey: PublicKey
-  ): Promise<number | null> => {
+  const quote = useMemo(() => {
+    if (!pool) return null;
     try {
-      const lamports = await conn.getBalance(pubkey, 'confirmed');
-      return lamports / LAMPORTS_PER_SOL;
-    } catch {
-      return null;
-    }
-  };
+      const raw = parseTokenAmount(amount, 9);
+      const slip = Number(slippage);
+      if (!Number.isFinite(slip) || slip < 0 || slip > 50 || !/^\d+(\.\d{1,2})?$/.test(slippage)) return null;
+      const out = calculateSwapOutput(raw, side === 'BUY' ? pool.totalReservesX : pool.totalReservesY, side === 'BUY' ? pool.totalReservesY : pool.totalReservesX);
+      if (out > (side === 'BUY' ? pool.realReservesY : pool.realReservesX)) return null;
+      const bps = BigInt(Math.round(slip * 100));
+      const minOut = out * (10_000n - bps) / 10_000n;
+      return minOut > 0n ? { raw, out, minOut } : null;
+    } catch { return null; }
+  }, [amount, pool, side, slippage]);
 
-  const refreshSolBalance = async (
-    conn: Connection,
-    pubkey: PublicKey | null | undefined
-  ): Promise<void> => {
-    if (!pubkey || executionMode === 'SANDBOX') {
-      setSolBalance(null);
-      return;
-    }
-    setSolBalance(await readSolBalance(conn, pubkey));
-  };
-
-  useEffect(() => {
-    let cancelled = false;
-    setSolBalance(null);
-    if (executionMode !== 'SANDBOX' && rpcReady && walletPubkey) {
-      void readSolBalance(rpcConnection, walletPubkey).then((balance) => { if (!cancelled) setSolBalance(balance); });
-    }
-    return () => { cancelled = true; };
-  }, [executionMode, rpcConnection, rpcReady, walletPubkey]);
-
-  // Cek kesiapan endpoint Pinata di dev server (tidak tersedia di build produksi).
-  useEffect(() => {
-    let cancelled = false;
-    void (async () => {
-      try {
-        const res = await fetch('/api/pinata/status');
-        const data = (await res.json()) as { configured?: boolean; message?: string };
-        if (!cancelled) {
-          setPinataStatus({
-            configured: data.configured === true,
-            message: data.message ?? '',
-          });
-        }
-      } catch {
-        if (!cancelled) {
-          setPinataStatus({
-            configured: false,
-            message:
-              'Endpoint upload Pinata hanya aktif saat `npm run dev` (bukan build produksi).',
-          });
-        }
+  const executeSwap = async (): Promise<void> => {
+    if (!beginAction()) return; setError(''); setSignature('');
+    try {
+      const payer = activePayer();
+      if (!pool || !quote) throw new Error('Jumlah atau estimasi swap tidak valid.');
+      const current = await sdk!.fetchPoolInfo(pool.poolAddress);
+      const actualOut = calculateSwapOutput(quote.raw, side === 'BUY' ? current.totalReservesX : current.totalReservesY, side === 'BUY' ? current.totalReservesY : current.totalReservesX);
+      if (actualOut < quote.minOut || actualOut > (side === 'BUY' ? current.realReservesY : current.realReservesX)) {
+        setPool(current); throw new Error('Harga atau likuiditas berubah; periksa estimasi baru sebelum mencoba lagi.');
       }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+      if (side === 'SELL' && quote.raw > await readSwapTokenBalance(connection, payer, current.tokenY, current.tokenProgramY)) throw new Error('Saldo token tidak mencukupi.');
+      const built = await sdk!.buildSwapTx({
+        user: payer, tokenX: current.tokenX, tokenY: current.tokenY, amountIn: quote.raw,
+        minAmountOut: quote.minOut, xToY: side === 'BUY', tokenProgramX: current.tokenProgramX,
+        tokenProgramY: current.tokenProgramY, unwrapWsol: side === 'SELL',
+      });
+      built.transaction.instructions.unshift(ComputeBudgetProgram.setComputeUnitLimit({ units: 300_000 }));
+      await dispatch(built.transaction, [], [170, 170], side === 'BUY' ? quote.raw : 0n);
+      setStatus('Swap terkonfirmasi.');
+      try { setPool(await sdk!.fetchPoolInfo(current.poolAddress)); } catch { setStatus('Swap terkonfirmasi, tetapi pool gagal diperbarui.'); }
+    } catch (err) { report(err); } finally { endAction(); }
+  };
 
-  /**
-   * Unggah gambar token ke IPFS via Pinata lewat dev API, lalu isi otomatis
-   * kolom Image URI (`imageUri`) dan Metadata JSON URI (`metadataUri`).
-   */
-  const handlePinataUpload = async (file: File): Promise<void> => {
-    setPinataUploadError(null);
-    setPinataUploadBusy(true);
+  const claimFee = async (): Promise<void> => {
+    if (!beginAction()) return; setError(''); setSignature('');
+    try {
+      const payer = activePayer();
+      if (!pool || !pool.creator.equals(payer)) throw new Error('Hanya creator pool dapat mengklaim fee.');
+      const claim = await sdk!.buildClaimCreatorFeeTx({ creator: payer, tokenX: pool.tokenX, tokenY: pool.tokenY, tokenProgramX: pool.tokenProgramX, tokenProgramY: pool.tokenProgramY });
+      await dispatch(claim.transaction, [], [170, 170]);
+      setStatus('Klaim fee creator terkonfirmasi.');
+      try { setPool(await sdk!.fetchPoolInfo(pool.poolAddress)); } catch { setStatus('Klaim terkonfirmasi, tetapi pool gagal diperbarui.'); }
+    } catch (err) { report(err); } finally { endAction(); }
+  };
+
+  const sellAll = async (): Promise<void> => {
+    if (!beginAction()) return; setError('');
+    try {
+      const payer = activePayer(); if (!pool) throw new Error('Pool belum dimuat.');
+      const raw = await readSwapTokenBalance(connection, payer, pool.tokenY, pool.tokenProgramY);
+      setTokenBalance(raw); setSide('SELL'); setAmount(formatExactTokenAmount(raw));
+    } catch (err) { report(err); } finally { endAction(); }
+  };
+
+  const uploadImage = async (file: File): Promise<void> => {
+    setUploadBusy(true); setError('');
     try {
       const base64 = await new Promise<string>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => {
-          const raw = String(reader.result ?? '');
-          const comma = raw.indexOf(',');
-          resolve(comma >= 0 ? raw.slice(comma + 1) : raw);
-        };
-        reader.onerror = () => reject(new Error('Gagal membaca file dari disk'));
-        reader.readAsDataURL(file);
+        const reader = new FileReader(); reader.onload = () => resolve(String(reader.result).split(',')[1] ?? '');
+        reader.onerror = () => reject(new Error('Gagal membaca gambar.')); reader.readAsDataURL(file);
       });
-
-      const res = await fetch('/api/pinata/upload', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          fileName: file.name,
-          base64,
-          name: tokenName,
-          symbol: ticker,
-          telegram,
-          twitter,
-        }),
-      });
-
-      const data = (await res.json()) as {
-        imageUri?: string;
-        metadataUri?: string;
-        error?: string;
-        detail?: string;
-      };
-
-      if (!res.ok || !data.imageUri || !data.metadataUri) {
-        throw new Error(data.detail ? `${data.error}: ${data.detail}` : (data.error ?? `HTTP ${res.status}`));
-      }
-
-      setImageUri(data.imageUri);
-      setMetadataUri(data.metadataUri);
-      setStatusBanner('Gambar & metadata berhasil diunggah ke IPFS via Pinata');
-    } catch (err) {
-      setPinataUploadError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setPinataUploadBusy(false);
-    }
+      const response = await fetch('/api/pinata/upload', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ fileName: file.name, base64, name, symbol, telegram, twitter }) });
+      const body = await response.json() as { imageUri?: string; metadataUri?: string; error?: string; detail?: string };
+      if (!response.ok || !body.imageUri || !body.metadataUri) throw new Error(body.detail ?? body.error ?? 'Upload gagal');
+      setImageUri(body.imageUri); setMetadataUri(body.metadataUri); setStatus('Gambar dan metadata diunggah.');
+    } catch (err) { report(err); } finally { setUploadBusy(false); }
   };
 
-  const handleConnectWallet = async (preferInjected: boolean): Promise<void> => {
-    setErrorMessage(null);
-    if (executionMode === 'MAINNET' && !preferInjected) { setErrorMessage('Mainnet memerlukan wallet Phantom.'); return; }
-    if (preferInjected && !window.solana) { setErrorMessage('Wallet Phantom tidak tersedia.'); return; }
-    setWalletBusy(true);
-    if (preferInjected && window.solana) {
-      try {
-        const res = await window.solana.connect();
-        setWalletPubkey(res.publicKey);
-        setWalletType('INJECTED');
-        setStatusBanner(
-          `Wallet Terhubung (${shortenAddress(res.publicKey.toBase58())})`
-        );
-        setWalletBusy(false);
-        return;
-      } catch (err) {
-        setErrorMessage(
-          err instanceof Error ? err.message : 'Gagal menghubungkan wallet'
-        );
-        setWalletBusy(false);
-        return;
-      }
-    }
-
-    setWalletPubkey(ephemeralKeypair.publicKey);
-    setWalletType('EPHEMERAL');
-    setStatusBanner(
-      `Mock Keypair Terhubung (${shortenAddress(ephemeralKeypair.publicKey.toBase58())})`
-    );
-    setWalletBusy(false);
-  };
-
-  const handleDisconnectWallet = async (): Promise<void> => {
-    if (walletType === 'INJECTED' && window.solana) {
-      await window.solana.disconnect().catch(() => undefined);
-    }
-    setWalletPubkey(null);
-    setWalletType(null);
-    setSolBalance(null);
-    setMainnetAcknowledged(false);
-    setStatusBanner('Wallet terputus');
-  };
-
-  /**
-   * Airdrop devnet untuk wallet ephemeral (mock) agar mode "Devnet RPC" bisa dipakai
-   * tanpa Phantom. RPC publik sering membatasi airdrop; bila gagal, pakai faucet.solana.com.
-   */
-  const handleAirdrop = async (): Promise<void> => {
-    const target = walletPubkey ?? ephemeralKeypair.publicKey;
-    setErrorMessage(null);
-    setAirdropBusy(true);
-    try {
-      if (executionMode !== 'DEVNET') {
-        throw new Error('Airdrop hanya tersedia pada mode Devnet RPC');
-      }
-      await assertRpcNetwork(devnetConnection, 'DEVNET');
-      const signature = await devnetConnection.requestAirdrop(
-        target,
-        LAMPORTS_PER_SOL
-      );
-      const latest = await devnetConnection.getLatestBlockhash('confirmed');
-      const confirmation = await devnetConnection.confirmTransaction(
-        {
-          signature,
-          blockhash: latest.blockhash,
-          lastValidBlockHeight: latest.lastValidBlockHeight,
-        },
-        'confirmed'
-      );
-      if (confirmation.value.err) {
-        throw new Error(JSON.stringify(confirmation.value.err));
-      }
-      setStatusBanner(
-        `Airdrop 1 SOL devnet berhasil (${shortenAddress(target.toBase58(), 5)})`
-      );
-      await refreshSolBalance(devnetConnection, target);
-    } catch (err) {
-      setErrorMessage(
-        `Airdrop gagal: ${
-          err instanceof Error ? err.message : String(err)
-        }. Coba faucet.solana.com atau ganti VITE_RPC_ENDPOINT.`
-      );
-    } finally {
-      setAirdropBusy(false);
-    }
-  };
-
-  const updateStep = (
-    stepNum: number,
-    patch: Partial<PipelineStepLog>
-  ): void => {
-    setSteps((prev) =>
-      prev.map((item) =>
-        item.step === stepNum ? { ...item, ...patch } : item
-      )
-    );
-  };
-
-  const signAndDispatch = async (
-    tx: Transaction,
-    extraSigners: Keypair[],
-    conn: Connection
-  ): Promise<{ signature: string; byteLength: number }> => {
-    if (!tx.feePayer) {
-      throw new Error('feePayer transaksi belum diset');
-    }
-
-    // Ambil blockhash + lastValidBlockHeight SEKALI, pakai pasangan yang sama saat
-    // sign & confirm (versi lama memakai blockhash baru setelah kirim, sehingga
-    // deteksi kedaluwarsa salah dan kegagalan on-chain tidak pernah terdeteksi).
-    let blockhash = tx.recentBlockhash;
-    let lastValidBlockHeight: number | undefined;
-    if (executionMode !== 'SANDBOX') {
-      await assertCurrentNetwork();
-      const latest = await conn.getLatestBlockhash('confirmed');
-      blockhash = latest.blockhash;
-      lastValidBlockHeight = latest.lastValidBlockHeight;
-      tx.recentBlockhash = latest.blockhash;
-    }
-
-    if (executionMode === 'MAINNET') {
-      assertMainnetWallet(mainnetAcknowledged, walletType, walletPubkey, window.solana?.publicKey, tx.feePayer);
-    }
-    if (extraSigners.length > 0) {
-      tx.partialSign(...extraSigners);
-    }
-    if (walletType === 'EPHEMERAL' || !walletType) {
-      tx.partialSign(ephemeralKeypair);
-    } else if (walletType === 'INJECTED' && window.solana) {
-      tx = await window.solana.signTransaction(tx);
-    } else {
-      throw new Error('Wallet injeksi tidak tersedia — hubungkan Phantom ulang');
-    }
-
-    const rawTx = tx.serialize();
-    if (executionMode === 'SANDBOX') {
-      await sleep(300);
-      const sig =
-        Keypair.generate().publicKey.toBase58() +
-        Keypair.generate().publicKey.toBase58().slice(0, 40);
-      return { signature: sig, byteLength: rawTx.byteLength };
-    }
-
-    let submittedSignature: string | null = null;
-    try {
-      await assertCurrentNetwork();
-      const signature = await conn.sendRawTransaction(rawTx, {
-        skipPreflight: false,
-        preflightCommitment: 'confirmed',
-        maxRetries: 3,
-      });
-
-      submittedSignature = signature;
-      const confirmation = await conn.confirmTransaction(
-        {
-          signature,
-          blockhash: blockhash as string,
-          lastValidBlockHeight: lastValidBlockHeight as number,
-        },
-        'confirmed'
-      );
-
-      if (confirmation.value.err) {
-        throw new Error(
-          `Transaksi ${signature} gagal on-chain: ${JSON.stringify(
-            confirmation.value.err
-          )}`
-        );
-      }
-
-      await refreshSolBalance(conn, tx.feePayer);
-      return { signature, byteLength: rawTx.byteLength };
-    } catch (err) {
-      const detail = describeRpcError(err, conn.rpcEndpoint, selectedProgramId ?? DEFAULT_AMM_PROGRAM_ID);
-      if (submittedSignature) {
-        throw new Error(`Transaksi ${submittedSignature} telah dikirim. Periksa status di Explorer ${executionMode} sebelum mengulang: ${detail}`);
-      }
-      throw new Error(detail);
-    }
-  };
-
-  /**
-   * Menulis akun biner `PoolState` (281B), `vault_x` (165B SPL), `vault_y` (165B Token-2022),
-   * dan `lp_mint` (82B Token-2022) ke Sandbox Ledger agar `fetchPoolInfo()` menjalankan
-   * jalur deserialisasi `PoolStateLayout.decode()` yang sesungguhnya.
-   */
-  const commitSandboxState = (params: {
-    poolAddress: PublicKey;
-    tokenX: PublicKey;
-    tokenY: PublicKey;
-    vaultX: PublicKey;
-    vaultY: PublicKey;
-    lpMint: PublicKey;
-    /** Fee vault creator (fee 0.06% per swap) */
-    feeVaultX: PublicKey;
-    feeVaultY: PublicKey;
-    creator: PublicKey;
-    creatorFeeX?: bigint;
-    creatorFeeY?: bigint;
-    tokenProgramY: PublicKey;
-    realX: bigint;
-    realY: bigint;
-    virtualX: bigint;
-    virtualY: bigint;
-    lpSupply: bigint;
-    bump: number;
-  }): void => {
-    const poolBuf = Buffer.alloc(POOL_STATE_SIZE);
-    PoolStateLayout.encode(
-      {
-        discriminator: POOL_STATE_DISCRIMINATOR,
-        tokenX: params.tokenX,
-        tokenY: params.tokenY,
-        vaultX: params.vaultX,
-        vaultY: params.vaultY,
-        lpMint: params.lpMint,
-        creator: params.creator,
-        feeVaultX: params.feeVaultX,
-        feeVaultY: params.feeVaultY,
-        virtualReservesX: params.virtualX,
-        virtualReservesY: params.virtualY,
-        bump: params.bump,
-      },
-      poolBuf
-    );
-    sandboxConnection.writeRawAccount(params.poolAddress, {
-      data: poolBuf,
-      executable: false,
-      lamports: 2_150_000,
-      owner: DEFAULT_AMM_PROGRAM_ID,
-      rentEpoch: 0,
-    });
-
-    const vaultXBuf = Buffer.alloc(SPL_TOKEN_ACCOUNT_SIZE);
-    SPL_TOKEN_ACCOUNT_LAYOUT.encode(
-      {
-        mint: params.tokenX,
-        owner: params.poolAddress,
-        amount: params.realX,
-        delegateOption: 0,
-        delegate: PublicKey.default,
-        state: 1,
-        isNativeOption: 1,
-        isNative: 2_039_280n,
-        delegatedAmount: 0n,
-        closeAuthorityOption: 0,
-        closeAuthority: PublicKey.default,
-      },
-      vaultXBuf
-    );
-    sandboxConnection.writeRawAccount(params.vaultX, {
-      data: vaultXBuf,
-      executable: false,
-      lamports: 2_039_280,
-      owner: TOKEN_PROGRAM_ID,
-      rentEpoch: 0,
-    });
-
-    const vaultYBuf = Buffer.alloc(SPL_TOKEN_ACCOUNT_SIZE);
-    SPL_TOKEN_ACCOUNT_LAYOUT.encode(
-      {
-        mint: params.tokenY,
-        owner: params.poolAddress,
-        amount: params.realY,
-        delegateOption: 0,
-        delegate: PublicKey.default,
-        state: 1,
-        isNativeOption: 0,
-        isNative: 0n,
-        delegatedAmount: 0n,
-        closeAuthorityOption: 0,
-        closeAuthority: PublicKey.default,
-      },
-      vaultYBuf
-    );
-    sandboxConnection.writeRawAccount(params.vaultY, {
-      data: vaultYBuf,
-      executable: false,
-      lamports: 2_039_280,
-      owner: params.tokenProgramY,
-      rentEpoch: 0,
-    });
-
-    // Fee vault creator (0.06% per swap) — ditulis agar `fetchPoolInfo()` membaca
-    // `creatorFeeX` / `creatorFeeY` lewat jalur deserialisasi yang sama.
-    const writeFeeVault = (
-      address: PublicKey,
-      mint: PublicKey,
-      programId: PublicKey,
-      amount: bigint
-    ): void => {
-      const buf = Buffer.alloc(SPL_TOKEN_ACCOUNT_SIZE);
-      SPL_TOKEN_ACCOUNT_LAYOUT.encode(
-        {
-          mint,
-          owner: params.poolAddress,
-          amount,
-          delegateOption: 0,
-          delegate: PublicKey.default,
-          state: 1,
-          isNativeOption: 0,
-          isNative: 0n,
-          delegatedAmount: 0n,
-          closeAuthorityOption: 0,
-          closeAuthority: PublicKey.default,
-        },
-        buf
-      );
-      sandboxConnection.writeRawAccount(address, {
-        data: buf,
-        executable: false,
-        lamports: 2_039_280,
-        owner: programId,
-        rentEpoch: 0,
-      });
-    };
-    writeFeeVault(params.feeVaultX, params.tokenX, TOKEN_PROGRAM_ID, params.creatorFeeX ?? 0n);
-    writeFeeVault(
-      params.feeVaultY,
-      params.tokenY,
-      params.tokenProgramY,
-      params.creatorFeeY ?? 0n
-    );
-
-    const lpMintBuf = Buffer.alloc(SPL_MINT_SIZE);
-    SPL_MINT_ACCOUNT_LAYOUT.encode(
-      {
-        mintAuthorityOption: 1,
-        mintAuthority: params.poolAddress,
-        supply: params.lpSupply,
-        decimals: DEFAULT_TOKEN_DECIMALS,
-        isInitialized: 1,
-        freezeAuthorityOption: 0,
-        freezeAuthority: PublicKey.default,
-      },
-      lpMintBuf
-    );
-    sandboxConnection.writeRawAccount(params.lpMint, {
-      data: lpMintBuf,
-      executable: false,
-      lamports: 1_461_600,
-      owner: TOKEN_2022_PROGRAM_ID,
-      rentEpoch: 0,
-    });
-  };
-
-  /**
-   * Pipeline Utama: Clone Token-2022 -> Initialize Virtual Liquidity Pool -> Optional Buy -> Fetch Pool Info
-   */
-  const handleLaunchPlatform = async (
-    e: React.FormEvent<HTMLFormElement>
-  ): Promise<void> => {
-    e.preventDefault();
-    setErrorMessage(null);
-    if (tokenStandard === 'TOKEN_2022' && !authorityAcknowledged &&
-        (!authoritySettings.mint || !authoritySettings.freeze || !authoritySettings.metadata)) {
-      setErrorMessage('Konfirmasi bahwa authority OFF bersifat permanen sebelum membuat token.');
-      return;
-    }
-
-    if (!operationAllowed) {
-      setErrorMessage('Periksa jaringan, program ID, wallet, dan persetujuan mainnet sebelum launch.');
-      return;
-    }
-    const activePayer = walletPubkey ?? ephemeralKeypair.publicKey;
-    if (!walletPubkey) {
-      setWalletPubkey(ephemeralKeypair.publicKey);
-      setWalletType('EPHEMERAL');
-    }
-
-    setPoolInfo(null);
-    setPoolMode(null);
-    setCopyStatus('');
-    setSandboxOwner(activePayer.toBase58());
-    setSandboxTokenBalanceRaw(0n);
-    setTelemetry(null);
-    setSteps([
-      {
-        step: 1,
-        label:
-          tokenStandard === 'TOKEN_2022'
-            ? 'Clone Token-2022 + MetadataPointer & On-Chain Socials'
-            : 'Clone SPL Legacy + Metaplex Metadata V3',
-        status: 'pending',
-      },
-      {
-        step: 2,
-        label: 'Initialize Virtual Liquidity Pool (transfer_checked)',
-        status: 'pending',
-      },
-      {
-        step: 3,
-        label: 'Initial SOL Swap (Opsional pada Detik ke-0)',
-        status: 'pending',
-      },
-      {
-        step: 4,
-        label: 'Fetch & Unpack 281-Byte PoolState + Vaults + Fee Vault',
-        status: 'pending',
-      },
-    ]);
-
-    const activeConnection =
-      executionMode === 'SANDBOX' ? sandboxConnection : rpcConnection;
-    const sdk = new CustomDefiSDK(activeConnection, selectedProgramId ?? DEFAULT_AMM_PROGRAM_ID);
-
-    let attemptedMint: string | null = null;
-    setStage('MINTING_TOKEN');
-    try {
-      // Check before creating a mint: do not leave an orphan token when AMM is absent.
-      await assertCurrentNetwork();
-      if (executionMode !== 'SANDBOX') {
-        const balance = await readSolBalance(rpcConnection, activePayer);
-        setSolBalance(balance);
-        if (balance === null) {
-          throw new Error(
-            `Tidak bisa membaca saldo dari ${rpcHost}. Periksa koneksi RPC.`
-          );
-        }
-        if (executionMode === 'DEVNET' && balance < MIN_DEVNET_SOL) {
-          throw new Error(
-            `Saldo devnet ${balance.toFixed(4)} SOL kurang dari ${MIN_DEVNET_SOL} SOL. Klik "Airdrop 1 SOL" (mock keypair) atau hubungkan Phantom yang punya SOL devnet.`
-          );
-        }
-      }
-
-      const supplyRaw = parseTokenAmount(totalSupply, DEFAULT_TOKEN_DECIMALS);
-      const virtualSolRaw = parseTokenAmount(
-        virtualSolLiquidity,
-        DEFAULT_TOKEN_DECIMALS
-      );
-      const firstBuySolRaw = parseTokenAmount(
-        initialBuySol || '0',
-        DEFAULT_TOKEN_DECIMALS
-      );
-
-      if (supplyRaw <= 0n || virtualSolRaw <= 0n) {
-        throw new Error(
-          'Total Supply dan Virtual SOL Liquidity harus lebih besar dari 0'
-        );
-      }
-
-      // ----------------------------------------------------------------------
-      // STEP 1: Clone Token-2022 (MetadataPointer + TokenMetadata + UpdateField)
-      // ----------------------------------------------------------------------
-      setStage('MINTING_TOKEN');
-      setStatusBanner(
-        tokenStandard === 'TOKEN_2022'
-          ? 'Minting Token-2022 + Menyimpan Nama, Simbol, URI & Sosial On-Chain...'
-          : 'Minting SPL Token + Metaplex Metadata V3...'
-      );
-      updateStep(1, {
-        status: 'active',
-        detail: 'Menyusun instruksi biner alokasi Mint, Metadata & MintToChecked...',
-      });
-
-      const cloneResult = await sdk.buildCloneTokenInstructions({
-        payer: activePayer,
-        name: tokenName,
-        symbol: ticker,
-        imageUri,
-        metadataUri: metadataUri.trim() || undefined,
-        telegram,
-        twitter,
-        decimals: DEFAULT_TOKEN_DECIMALS,
-        initialSupplyRaw: supplyRaw,
-        tokenStandard,
-        ...(tokenStandard === 'TOKEN_2022' ? { authorities: authoritySettings } : {}),
-      });
-
-      const cloneTx = new Transaction().add(
-        ComputeBudgetProgram.setComputeUnitLimit({
-          units: CLONE_TX_COMPUTE_UNITS,
-        }),
-        ...cloneResult.instructions
-      );
-      cloneTx.feePayer = activePayer;
-      cloneTx.recentBlockhash = (
-        await activeConnection.getLatestBlockhash('confirmed')
-      ).blockhash;
-
-      assertMintToCheckedLayout(cloneResult.instructions, cloneResult.userTokenAta);
-      try {
-        // Fail before signing or sending if metadata + authority instructions exceed a packet.
-        cloneTx.serialize({ requireAllSignatures: false, verifySignatures: false });
-      } catch {
-        throw new Error('Transaksi pembuatan token terlalu besar; pendekkan nama, URI, atau metadata sosial lalu coba lagi.');
-      }
-      logTxLayout('clone-tx', cloneTx.instructions);
-
-      attemptedMint = cloneResult.mint.toBase58();
-      await signAndDispatch(
-        cloneTx,
-        [cloneResult.mintKeypair],
-        activeConnection
-      );
-
-      updateStep(1, {
-        status: 'done',
-        detail: `Mint ${cloneResult.mint.toBase58()} (${cloneResult.allocatedMintBytes}B Mint, ${cloneResult.instructions.length} raw ixs)`,
-      });
-
-      // ----------------------------------------------------------------------
-      // STEP 2: Initialize Virtual Pool (`initialize_pool` — Discriminator 0)
-      // ----------------------------------------------------------------------
-      setStage('INITIALIZING_POOL');
-      setStatusBanner(
-        'Initializing Hybrid Token-2022 Virtual Liquidity Pool (0 Real SOL)...'
-      );
-      updateStep(2, {
-        status: 'active',
-        detail: 'Serialisasi 17B BufferLayout + transfer_checked 100% suplai ke vault_y...',
-      });
-
-      const createPoolResult = await sdk.buildCreatePoolTx({
-        payer: activePayer,
-        tokenX: NATIVE_SOL_MINT,
-        tokenY: cloneResult.mint,
-        initialRealTokenY: supplyRaw,
-        virtualReservesX: virtualSolRaw,
-        tokenProgramX: TOKEN_PROGRAM_ID,
-        tokenProgramY: cloneResult.tokenProgramId,
-        tokenProgramLp: TOKEN_2022_PROGRAM_ID,
-      });
-
-      await signAndDispatch(
-        withComputeBudget(createPoolResult.transaction, AMM_TX_COMPUTE_UNITS),
-        [],
-        activeConnection
-      );
-
-      let realX = 0n;
-      let realY = supplyRaw;
-      let lastSwapHex: string | undefined;
-
-      if (executionMode === 'SANDBOX') {
-        commitSandboxState({
-          poolAddress: createPoolResult.addresses.poolState,
-          tokenX: NATIVE_SOL_MINT,
-          tokenY: cloneResult.mint,
-          vaultX: createPoolResult.addresses.vaultX,
-          vaultY: createPoolResult.addresses.vaultY,
-          lpMint: createPoolResult.addresses.lpMint,
-          feeVaultX: createPoolResult.addresses.feeVaultX,
-          feeVaultY: createPoolResult.addresses.feeVaultY,
-          creator: activePayer,
-          tokenProgramY: cloneResult.tokenProgramId,
-          realX,
-          realY,
-          virtualX: virtualSolRaw,
-          // `initialize_pool` menyimpan virtual_reserves_y = 0: seluruh suplai token
-          // fisik sudah berada di `vault_y`, jadi token Y tidak boleh dihitung dua kali.
-          virtualY: 0n,
-          lpSupply: createPoolResult.expectedInitialLp,
-          bump: createPoolResult.addresses.poolBump,
-        });
-      }
-
-      updateStep(2, {
-        status: 'done',
-        detail: `Pool ${shortenAddress(createPoolResult.addresses.poolState.toBase58())} | LP Awal: ${formatTokenAmount(createPoolResult.expectedInitialLp, 9, 2)}`,
-      });
-
-      // ----------------------------------------------------------------------
-      // STEP 3: Optional First Swap (`swap` — Discriminator 2)
-      // ----------------------------------------------------------------------
-      if (firstBuySolRaw > 0n) {
-        setStage('INITIAL_SWAP');
-        setStatusBanner('Mengeksekusi Pembelian Awal via Token-2022 transfer_checked...');
-        updateStep(3, {
-          status: 'active',
-          detail: `Membeli dengan ${formatTokenAmount(firstBuySolRaw)} SOL...`,
-        });
-
-        // Cadangan efektif = vault.amount + virtual_reserves (virtual_reserves_y = 0).
-        const totalX = realX + virtualSolRaw;
-        const totalY = realY;
-        const expectedOut = calculateSwapOutput(firstBuySolRaw, totalX, totalY);
-
-        const swapBuild = await sdk.buildSwapTx({
-          user: activePayer,
-          tokenX: NATIVE_SOL_MINT,
-          tokenY: cloneResult.mint,
-          amountIn: firstBuySolRaw,
-          minAmountOut: expectedOut,
-          xToY: true,
-          tokenProgramX: TOKEN_PROGRAM_ID,
-          tokenProgramY: cloneResult.tokenProgramId,
-        });
-
-        await signAndDispatch(
-          withComputeBudget(swapBuild.transaction, AMM_TX_COMPUTE_UNITS),
-          [],
-          activeConnection
-        );
-        lastSwapHex = swapBuild.serializedIxData.toString('hex');
-
-        realX += firstBuySolRaw;
-        realY -= expectedOut;
-        if (executionMode === 'SANDBOX') {
-          setSandboxTokenBalanceRaw(expectedOut);
-          commitSandboxState({
-            poolAddress: createPoolResult.addresses.poolState,
-            tokenX: NATIVE_SOL_MINT,
-            tokenY: cloneResult.mint,
-            vaultX: createPoolResult.addresses.vaultX,
-            vaultY: createPoolResult.addresses.vaultY,
-            lpMint: createPoolResult.addresses.lpMint,
-            feeVaultX: createPoolResult.addresses.feeVaultX,
-            feeVaultY: createPoolResult.addresses.feeVaultY,
-            creator: activePayer,
-            creatorFeeX: calculateCreatorFee(firstBuySolRaw),
-            tokenProgramY: cloneResult.tokenProgramId,
-            realX,
-            realY,
-            virtualX: virtualSolRaw,
-            virtualY: 0n,
-            lpSupply: createPoolResult.expectedInitialLp,
-            bump: createPoolResult.addresses.poolBump,
-          });
-        }
-
-        updateStep(3, {
-          status: 'done',
-          detail: `Diterima ${formatTokenAmount(expectedOut, 9, 2)} ${ticker.toUpperCase()}`,
-        });
-      } else {
-        updateStep(3, {
-          status: 'done',
-          detail: 'Dilewati (0 SOL Modal Riil Awal)',
-        });
-      }
-
-      // ----------------------------------------------------------------------
-      // STEP 4: Fetch & Unpack 281-Byte PoolState + Vault Reserves + Fee Vault
-      // ----------------------------------------------------------------------
-      setStage('FETCHING_POOL');
-      setStatusBanner('Membaca & Deserialisasi PoolState + Token-2022 Vaults...');
-      updateStep(4, {
-        status: 'active',
-        detail: 'Unpacking 281B PoolStateLayout + 165B Vaults + Fee Vault...',
-      });
-
-      await sleep(200);
-      const unpacked = await sdk.fetchPoolInfo(
-        NATIVE_SOL_MINT,
-        cloneResult.mint
-      );
-
-      setTelemetry({
-        mintAddress: cloneResult.mint.toBase58(),
-        tokenStandard: cloneResult.tokenStandard,
-        tokenProgramY: cloneResult.tokenProgramId.toBase58(),
-        allocatedMintBytes: cloneResult.allocatedMintBytes,
-        additionalMetadata: cloneResult.additionalMetadata,
-        createPoolIxHex: createPoolResult.serializedIxData.toString('hex'),
-        lastSwapIxHex: lastSwapHex,
-        cloneIxCount: cloneResult.instructions.length,
-      });
-
-      setPoolMode(executionMode);
-      setPoolInfo(unpacked);
-      updateStep(4, {
-        status: 'done',
-        detail: `281B PoolState Terbaca | Total Efektif X: ${formatTokenAmount(unpacked.totalReservesX, 9, 2)} SOL`,
-      });
-
-      setStage('SUCCESS');
-      setStatusBanner(
-        `Success! $${ticker.trim().toUpperCase()} (${cloneResult.tokenStandard}) aktif di Virtual Liquidity AMM`
-      );
-    } catch (err) {
-      const reason = err instanceof Error ? err.message : 'Transaksi gagal';
-      const msg = attemptedMint && executionMode !== 'SANDBOX'
-        ? `${reason} Mint yang dicoba: ${attemptedMint}. Periksa Explorer dan status transaksi sebelum mengulang launch.`
-        : reason;
-      setStage('ERROR');
-      setErrorMessage(msg);
-      setStatusBanner(`Pipeline terhenti: ${msg}`);
-      setSteps((prev) =>
-        prev.map((item) =>
-          item.status === 'active'
-            ? { ...item, status: 'error', detail: msg }
-            : item
-        )
-      );
-    }
-  };
-
-  // Estimasi Swap Real-time (`total_reserve = vault.amount + virtual_reserves`)
-  const swapQuote = useMemo(() => {
-    if (!poolInfo) return null;
-    try {
-      const amountInRaw = parseTokenAmount(
-        tradeAmountInput,
-        DEFAULT_TOKEN_DECIMALS
-      );
-      if (amountInRaw <= 0n) return null;
-
-      const isBuy = tradeSide === 'BUY';
-      const reserveIn = isBuy
-        ? poolInfo.totalReservesX
-        : poolInfo.totalReservesY;
-      const reserveOut = isBuy
-        ? poolInfo.totalReservesY
-        : poolInfo.totalReservesX;
-
-      const amountOut = calculateSwapOutput(amountInRaw, reserveIn, reserveOut);
-      const vaultAvailable = isBuy
-        ? poolInfo.realReservesY
-        : poolInfo.realReservesX;
-      if (amountOut > vaultAvailable) {
-        return null;
-      }
-
-      return {
-        amountInRaw,
-        amountOut,
-        feeRaw: (amountInRaw * 3n) / 1000n,
-      };
-    } catch {
-      return null;
-    }
-  }, [poolInfo, tradeAmountInput, tradeSide]);
-
-  const handleExecuteSwap = async (): Promise<void> => {
-    if (!poolInfo || !swapQuote || poolMode !== executionMode || !operationAllowed) return;
-    setErrorMessage(null);
-
-    const activeUser = walletPubkey ?? ephemeralKeypair.publicKey;
-    const activeConnection =
-      executionMode === 'SANDBOX' ? sandboxConnection : rpcConnection;
-    const sdk = new CustomDefiSDK(activeConnection, selectedProgramId ?? DEFAULT_AMM_PROGRAM_ID);
-
-    setStage('SWAPPING');
-    try {
-      if (executionMode === 'SANDBOX' && sandboxOwner !== activeUser.toBase58()) {
-        throw new Error('Pool sandbox hanya mendukung wallet yang membuat pool');
-      }
-      if (tradeSide === 'SELL') {
-        const balance = executionMode !== 'SANDBOX'
-          ? await readSwapTokenBalance(rpcConnection, activeUser, poolInfo.tokenY, poolInfo.tokenProgramY)
-          : userTokenBalanceRaw;
-        if (balance === null || swapQuote.amountInRaw > balance) {
-          throw new Error(`Saldo ${ticker.toUpperCase()} tidak mencukupi atau belum tersedia`);
-        }
-      }
-
-      const isBuy = tradeSide === 'BUY';
-      setStatusBanner(
-        isBuy
-          ? `Swap ${tradeAmountInput} SOL -> $${ticker.toUpperCase()} (Token-2022 transfer_checked)...`
-          : `Swap ${tradeAmountInput} $${ticker.toUpperCase()} -> SOL (Token-2022 transfer_checked)...`
-      );
-
-      if (executionMode === 'DEVNET' && isBuy) {
-        const balance = await readSolBalance(rpcConnection, activeUser);
-        setSolBalance(balance);
-        if (balance !== null && balance < MIN_DEVNET_SOL) {
-          throw new Error(
-            `Saldo devnet ${balance.toFixed(4)} SOL tidak cukup untuk swap. Lakukan airdrop terlebih dahulu.`
-          );
-        }
-      }
-
-      const swapBuild = await sdk.buildSwapTx({
-        user: activeUser,
-        tokenX: poolInfo.tokenX,
-        tokenY: poolInfo.tokenY,
-        amountIn: swapQuote.amountInRaw,
-        minAmountOut: swapQuote.amountOut,
-        xToY: isBuy,
-        tokenProgramX: poolInfo.tokenProgramX,
-        tokenProgramY: poolInfo.tokenProgramY,
-        // Saat menjual, WSOL hasil swap dicairkan menjadi SOL native.
-        unwrapWsol: !isBuy,
-      });
-
-      await signAndDispatch(
-        withComputeBudget(swapBuild.transaction, AMM_TX_COMPUTE_UNITS),
-        [],
-        activeConnection
-      );
-
-      if (executionMode === 'SANDBOX') {
-        const nextRealX = isBuy
-          ? poolInfo.realReservesX + swapQuote.amountInRaw
-          : poolInfo.realReservesX - swapQuote.amountOut;
-        const nextRealY = isBuy
-          ? poolInfo.realReservesY - swapQuote.amountOut
-          : poolInfo.realReservesY + swapQuote.amountInRaw;
-
-        const creatorFeeRaw = calculateCreatorFee(swapQuote.amountInRaw);
-        commitSandboxState({
-          poolAddress: poolInfo.poolAddress,
-          tokenX: poolInfo.tokenX,
-          tokenY: poolInfo.tokenY,
-          vaultX: poolInfo.vaultX,
-          vaultY: poolInfo.vaultY,
-          lpMint: poolInfo.lpMint,
-          feeVaultX: poolInfo.feeVaultX,
-          feeVaultY: poolInfo.feeVaultY,
-          creator: poolInfo.creator,
-          // Fee creator 0.06% diakumulasi ke fee vault sisi input.
-          creatorFeeX:
-            poolInfo.creatorFeeX + (isBuy ? creatorFeeRaw : 0n),
-          creatorFeeY:
-            poolInfo.creatorFeeY + (isBuy ? 0n : creatorFeeRaw),
-          tokenProgramY: poolInfo.tokenProgramY,
-          realX: nextRealX,
-          realY: nextRealY,
-          virtualX: poolInfo.virtualReservesX,
-          virtualY: poolInfo.virtualReservesY,
-          lpSupply: poolInfo.lpSupply,
-          bump: poolInfo.bump,
-        });
-
-        setSandboxTokenBalanceRaw((prev) =>
-          isBuy ? prev + swapQuote.amountOut : prev - swapQuote.amountInRaw
-        );
-      }
-
-      setBalanceRevision((value) => value + 1);
-      const refreshed = await sdk.fetchPoolInfo(poolInfo.poolAddress);
-      setPoolInfo(refreshed);
-      setTelemetry((prev) =>
-        prev
-          ? {
-              ...prev,
-              lastSwapIxHex: swapBuild.serializedIxData.toString('hex'),
-            }
-          : prev
-      );
-
-      setStage('SUCCESS');
-      setStatusBanner(
-        `Swap Selesai! Vault X (SOL Riil): ${formatTokenAmount(refreshed.realReservesX, 9, 4)} SOL`
-      );
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Swap gagal';
-      setStage('ERROR');
-      setErrorMessage(msg);
-      setStatusBanner(`Swap gagal: ${msg}`);
-    }
-  };
-
-  /**
-   * Klaim fee creator (0.06% per swap) dari `fee_vault_x` / `fee_vault_y`.
-   * Di mode Devnet memakai transaksi `claim_creator_fee` sungguhan; di Sandbox
-   * fee vault dikosongkan pada ledger lokal agar alur UI-nya tetap teruji.
-   */
-  const handleClaimCreatorFee = async (): Promise<void> => {
-    if (!poolInfo || poolMode !== executionMode || !operationAllowed) return;
-    const activeUser = walletPubkey ?? ephemeralKeypair.publicKey;
-    const activeConnection =
-      executionMode === 'SANDBOX' ? sandboxConnection : rpcConnection;
-    const sdk = new CustomDefiSDK(activeConnection, selectedProgramId ?? DEFAULT_AMM_PROGRAM_ID);
-
-    setErrorMessage(null);
-
-    if (!poolInfo.creator.equals(activeUser)) {
-      setErrorMessage(
-        `Hanya creator pool (${shortenAddress(poolInfo.creator.toBase58())}) yang bisa mengklaim fee ini. Wallet aktif: ${shortenAddress(activeUser.toBase58())}.`
-      );
-      return;
-    }
-    if (poolInfo.creatorFeeX === 0n && poolInfo.creatorFeeY === 0n) {
-      setErrorMessage(
-        'Belum ada fee creator yang terakumulasi — fee 0.06% baru terisi setelah ada swap.'
-      );
-      return;
-    }
-
-    try {
-      setClaimBusy(true);
-      setStatusBanner('Mengklaim fee creator (claim_creator_fee, disc 3)...');
-
-      if (executionMode === 'SANDBOX') {
-        setSandboxTokenBalanceRaw((prev) => prev + poolInfo.creatorFeeY);
-        commitSandboxState({
-          poolAddress: poolInfo.poolAddress,
-          tokenX: poolInfo.tokenX,
-          tokenY: poolInfo.tokenY,
-          vaultX: poolInfo.vaultX,
-          vaultY: poolInfo.vaultY,
-          lpMint: poolInfo.lpMint,
-          feeVaultX: poolInfo.feeVaultX,
-          feeVaultY: poolInfo.feeVaultY,
-          creator: poolInfo.creator,
-          creatorFeeX: 0n,
-          creatorFeeY: 0n,
-          tokenProgramY: poolInfo.tokenProgramY,
-          realX: poolInfo.realReservesX,
-          realY: poolInfo.realReservesY,
-          virtualX: poolInfo.virtualReservesX,
-          virtualY: poolInfo.virtualReservesY,
-          lpSupply: poolInfo.lpSupply,
-          bump: poolInfo.bump,
-        });
-      } else {
-        const claim = await sdk.buildClaimCreatorFeeTx({
-          creator: activeUser,
-          tokenX: poolInfo.tokenX,
-          tokenY: poolInfo.tokenY,
-        });
-        await signAndDispatch(claim.transaction, [], activeConnection);
-      }
-
-      setBalanceRevision((value) => value + 1);
-      const refreshed = await sdk.fetchPoolInfo(poolInfo.poolAddress);
-      setPoolInfo(refreshed);
-      setStatusBanner(
-        `Fee creator terklaim — sisa X: ${formatTokenAmount(refreshed.creatorFeeX, 9, 6)} SOL, Y: ${formatTokenAmount(refreshed.creatorFeeY, 9, 6)} ${ticker.toUpperCase()}`
-      );
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Klaim fee creator gagal';
-      setErrorMessage(msg);
-      setStatusBanner(`Klaim fee creator gagal: ${msg}`);
-    } finally {
-      setClaimBusy(false);
-    }
-  };
-
-  const isBusy =
-    stage === 'MINTING_TOKEN' ||
-    stage === 'INITIALIZING_POOL' ||
-    stage === 'INITIAL_SWAP' ||
-    stage === 'FETCHING_POOL' ||
-    stage === 'SWAPPING';
-
-  return (
-    <div className="min-h-screen bg-zinc-950 text-zinc-100">
-      {/* Header */}
-      <header className="border-b border-zinc-800/90 bg-zinc-950/90 backdrop-blur">
-        <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-4 px-5 py-4">
-          <div className="flex items-center gap-3">
-            <div className="flex h-9 w-9 items-center justify-center rounded-lg border border-emerald-500/40 bg-emerald-500/10 font-mono text-xs font-bold text-emerald-400">
-              T22
-            </div>
-            <div>
-              <h1 className="text-base font-semibold tracking-tight text-zinc-100">
-                Solana Token-2022 Launchpad &amp; Virtual Liquidity AMM
-              </h1>
-              <p className="font-mono text-xs text-zinc-400">
-                Native <code className="text-emerald-400">TokenInterface</code>{' '}
-                + <code className="text-cyan-300">transfer_checked</code> &bull;
-                Zero External SDKs &bull; build{' '}
-                <code className="text-zinc-300" title="Stempel layout SDK terbaru">
-                  {SDK_BUILD_TAG}
-                </code>
-                {executionMode !== 'SANDBOX' && <> &bull; {executionMode} · RPC {rpcHost}</>}
-              </p>
-            </div>
-          </div>
-
-          <div className="flex flex-wrap items-center gap-2.5">
-            <div role="group" aria-label="Pilih jaringan" className="inline-flex rounded-lg border border-zinc-800 bg-zinc-900 p-0.5 text-xs">
-              {(['SANDBOX', 'DEVNET', 'MAINNET'] as const).map((mode) => (
-                <button key={mode} type="button" aria-pressed={executionMode === mode}
-                  disabled={isBusy || claimBusy || airdropBusy || walletBusy}
-                  onClick={() => {
-                    setExecutionMode(mode);
-                    setSolBalance(null);
-                    setMainnetAcknowledged(false);
-                    setErrorMessage(null);
-                    if (mode === 'MAINNET' && walletType === 'EPHEMERAL') {
-                      setWalletPubkey(null);
-                      setWalletType(null);
-                    }
-                  }}
-                  className={`rounded-md px-2.5 py-1 font-semibold transition disabled:opacity-50 ${executionMode === mode ? (mode === 'MAINNET' ? 'bg-rose-600 text-white' : 'bg-zinc-800 text-cyan-300') : 'text-zinc-400 hover:text-zinc-200'}`}>
-                  {mode === 'SANDBOX' ? 'Binary Sandbox' : mode === 'MAINNET' ? 'MAINNET' : 'Devnet'}
-                </button>
-              ))}
-            </div>
-
-            {walletPubkey ? (
-              <div className="flex items-center gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-1.5 text-xs">
-                <span className="h-2 w-2 rounded-full bg-emerald-400" />
-                <span className="font-mono text-emerald-200">
-                  {shortenAddress(walletPubkey.toBase58(), 5)}
-                </span>
-                <button
-                  type="button"
-                  onClick={handleDisconnectWallet}
-                  disabled={isBusy || claimBusy || airdropBusy || walletBusy}
-                  className="ml-1 text-zinc-400 hover:text-zinc-100"
-                >
-                  &times;
-                </button>
-              </div>
-            ) : (
-              <div className="flex items-center gap-2">
-                {executionMode !== 'MAINNET' && <button
-                  type="button"
-                  disabled={isBusy || claimBusy || airdropBusy || walletBusy}
-                  onClick={() => handleConnectWallet(false)}
-                  className="rounded-lg border border-emerald-500/50 bg-emerald-500/15 px-3.5 py-1.5 text-xs font-medium text-emerald-300 transition hover:bg-emerald-500/25"
-                >
-                  Connect Mock Keypair
-                </button>}
-                {typeof window !== 'undefined' && window.solana && (
-                  <button
-                    type="button"
-                    disabled={isBusy || claimBusy || airdropBusy || walletBusy}
-                    onClick={() => handleConnectWallet(true)}
-                    className="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-xs font-medium text-zinc-200 transition hover:border-zinc-600"
-                  >
-                    Phantom
-                  </button>
-                )}
-              </div>
-            )}
-
-            {executionMode !== 'SANDBOX' && (
-              <div className="flex items-center gap-2">
-                <span
-                  className="rounded-lg border border-zinc-800 bg-zinc-900 px-2.5 py-1.5 font-mono text-xs text-zinc-300"
-                  title={`Saldo ${walletPubkey ? shortenAddress(walletPubkey.toBase58()) : 'wallet'} di ${rpcHost}`}
-                >
-                  {solBalance === null ? '— SOL' : `${solBalance.toFixed(4)} SOL`}
-                </span>
-                {executionMode === 'DEVNET' && walletType !== 'INJECTED' && (
-                  <button
-                    type="button"
-                    onClick={handleAirdrop}
-                    disabled={airdropBusy || isBusy}
-                    className="rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-2.5 py-1.5 text-xs font-medium text-cyan-300 transition hover:bg-cyan-500/20 disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    {airdropBusy ? 'Airdrop...' : 'Airdrop 1 SOL'}
-                  </button>
-                )}
-              </div>
-            )}
-          </div>
+  return <div className="min-h-screen bg-zinc-950 text-zinc-100">
+    <header className="border-b border-zinc-800 px-5 py-4"><div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-3">
+      <div><h1 className="font-semibold">Mini DeFi Token Launchpad &amp; AMM</h1><p className="text-xs text-rose-300">MAINNET BETA · SOL nyata · tidak ada simulasi</p></div>
+      <div className="flex items-center gap-3 text-xs"><span>{balance === null ? '—' : (balance / 1e9).toFixed(6)} SOL</span>
+        {connected ? <button className={button} disabled={busy} onClick={() => void disconnect().catch(report)}>Putuskan {publicKey?.toBase58().slice(0, 8)}…</button> :
+          <button className={button} disabled={busy || connecting || !wallet} onClick={() => void connect().catch(report)}>{connecting ? 'Menghubungkan…' : 'Hubungkan Phantom'}</button>}
+      </div>
+    </div></header>
+    <main className="mx-auto max-w-6xl space-y-4 px-5 py-5">
+      <div className="rounded-lg border border-rose-500/50 bg-rose-950/40 p-4 text-xs text-rose-100">
+        <strong>MAINNET RIIL.</strong> Transaksi memakai dana nyata, tidak bisa dibatalkan, dan belum diaudit. Tidak ada fitur remove liquidity. Mematikan authority permanen tidak menjamin bebas rug pull.
+        <p className="mt-2 break-all">Program ID: {programId?.toBase58() ?? 'belum diatur'} · {networkStatus} <button type="button" onClick={() => setNetworkRevision((n) => n + 1)} className="underline">Periksa ulang</button></p>
+        <label className="mt-2 flex gap-2"><input type="checkbox" checked={riskAccepted} onChange={(e) => setRiskAccepted(e.target.checked)} disabled={busy} /> Saya memahami bahwa transaksi ini menggunakan SOL asli.</label>
+      </div>
+      <div className={card}><p role="status" className="break-all text-xs">{status}</p>{error && <p role="alert" className="mt-2 break-all text-xs text-rose-300">{error}</p>}{signature && <a className="mt-2 block break-all text-xs text-cyan-300 underline" href={`https://explorer.solana.com/tx/${signature}`} target="_blank" rel="noreferrer">Lihat transaksi {signature}</a>}</div>
+      <div className="grid gap-4 lg:grid-cols-2">
+        <form className={`${card} space-y-3`} onSubmit={(e) => void launch(e)}>
+          <h2 className="font-semibold">Launch token &amp; virtual pool</h2><p className="text-xs text-zinc-400">Mint dan pool dalam satu transaksi. Tidak ada setoran SOL riil awal; rent dan fee tetap dibayar.</p>
+          <div className="grid grid-cols-2 gap-3"><div><label className={label} htmlFor="name">Nama</label><input id="name" className={input} value={name} onChange={(e) => setName(e.target.value)} required /></div><div><label className={label} htmlFor="symbol">Ticker</label><input id="symbol" className={input} value={symbol} onChange={(e) => setSymbol(e.target.value.toUpperCase())} required /></div></div>
+          <div><label className={label} htmlFor="image">Image URI</label><input id="image" className={input} value={imageUri} onChange={(e) => setImageUri(e.target.value)} required /></div>
+          <div><label className={label} htmlFor="metadata">Metadata JSON URI (opsional)</label><input id="metadata" className={input} value={metadataUri} onChange={(e) => setMetadataUri(e.target.value)} /></div>
+          <div><label className={label} htmlFor="upload">Upload gambar via Pinata (dev server)</label><input id="upload" type="file" accept="image/*" disabled={uploadBusy || busy} onChange={(e) => { const file = e.target.files?.[0]; if (file) void uploadImage(file); e.target.value = ''; }} className="text-xs" />{uploadBusy && <span className="text-xs"> Mengunggah…</span>}</div>
+          <div className="grid grid-cols-2 gap-3"><div><label className={label} htmlFor="telegram">Telegram (opsional)</label><input id="telegram" className={input} value={telegram} onChange={(e) => setTelegram(e.target.value)} /></div><div><label className={label} htmlFor="twitter">Twitter (opsional)</label><input id="twitter" className={input} value={twitter} onChange={(e) => setTwitter(e.target.value)} /></div></div>
+          <p className="text-xs text-amber-300">Transaksi gabungan maksimum 1.232 byte. Jika terlalu besar, pendekkan nama, URI, atau metadata sosial.</p>
+          <div className="grid grid-cols-2 gap-3"><div><label className={label} htmlFor="supply">Supply</label><input id="supply" className={input} value={supply} onChange={(e) => setSupply(e.target.value)} /></div><div><label className={label} htmlFor="virtual">Virtual SOL</label><input id="virtual" className={input} value={virtualSol} onChange={(e) => setVirtualSol(e.target.value)} /></div></div>
+          <fieldset className="space-y-2 rounded-lg border border-zinc-700 p-3" disabled={busy}><legend className="text-xs">Authority token baru</legend>
+            {(['mint', 'freeze', 'metadata'] as const).map((key) => <label key={key} className="flex justify-between gap-2 text-xs"><span>{key === 'metadata' ? 'Metadata update + pointer' : key === 'mint' ? 'Mint authority' : 'Freeze authority'}</span><span><input type="checkbox" checked={authority[key]} onChange={(e) => { setAuthority((v) => ({ ...v, [key]: e.target.checked })); setAuthorityAcknowledged(false); }} /> {authority[key] ? 'ON' : 'OFF'}</span></label>)}
+            <p className="text-xs text-amber-300">OFF permanen. Konten eksternal HTTPS tetap bisa berubah.</p><label className="flex gap-2 text-xs"><input type="checkbox" checked={authorityAcknowledged} onChange={(e) => setAuthorityAcknowledged(e.target.checked)} /> Saya memahami authority OFF permanen.</label>
+          </fieldset><button className={`${button} w-full`} disabled={busy || !networkReady || !connected || !riskAccepted || uploadBusy}>Launch via wallet</button>
+        </form>
+        <section className="space-y-4"><div className={`${card} space-y-3`}><h2 className="font-semibold">Pool &amp; mint</h2><label className={label} htmlFor="mint">Alamat mint</label><div className="flex gap-2"><input id="mint" className={input} value={mintInput} onChange={(e) => { setMintInput(e.target.value); setPool(null); setCopyStatus(''); }} /><button type="button" className={button} onClick={() => { void navigator.clipboard.writeText(mintInput).then(() => setCopyStatus('Mint disalin')).catch(() => setCopyStatus('Pilih dan salin alamat secara manual.')); }}>Copy Mint</button></div><p className="text-xs">{copyStatus}</p><button type="button" className={button} disabled={busy || !networkReady} onClick={() => void loadPool()}>Muat pool</button>
+          {pool && <div className="space-y-1 break-all text-xs text-zinc-300"><p>Pool: {pool.poolAddress.toBase58()}</p><p>SOL riil: {formatExactTokenAmount(pool.realReservesX)}</p><p>SOL virtual: {formatExactTokenAmount(pool.virtualReservesX)}</p><p>Token riil: {formatExactTokenAmount(pool.realReservesY)}</p><p>Saldo ATA Anda: {tokenBalance === null ? '—' : formatExactTokenAmount(tokenBalance)}</p><p>Fee creator: {formatExactTokenAmount(pool.creatorFeeX)} SOL + {formatExactTokenAmount(pool.creatorFeeY)} token</p><button type="button" className={button} disabled={busy || !connected || !riskAccepted || !pool.creator.equals(publicKey ?? PublicKey.default)} onClick={() => void claimFee()}>Claim fee</button></div>}
         </div>
-      </header>
-
-      {executionMode !== 'SANDBOX' && (
-        <div role="status" className={`mx-auto mt-3 max-w-6xl rounded-lg border px-4 py-3 text-xs ${executionMode === 'MAINNET' ? 'border-rose-500/60 bg-rose-950/50 text-rose-100' : 'border-cyan-500/40 bg-cyan-950/30 text-cyan-100'}`}>
-          <div className="font-bold">{executionMode === 'MAINNET' ? 'MAINNET — SOL NYATA, TRANSAKSI TIDAK DAPAT DIBATALKAN' : 'DEVNET — SOL UJI'}</div>
-          <div>RPC: {rpcHost} · Program ID: <span className="break-all font-mono">{selectedProgramId?.toBase58() ?? 'belum dikonfigurasi'}</span></div>
-          <div>{networkStatus?.key === networkKey ? networkStatus.message : 'Memeriksa jaringan…'}{' '}
-            <button type="button" onClick={() => setNetworkRevision((n) => n + 1)} className="underline" disabled={isBusy || claimBusy}>Periksa ulang</button>
-          </div>
-          {executionMode === 'MAINNET' && <>
-            <p className="mt-1">Gunakan Phantom dengan jaringan mainnet. Pengecekan hanya memastikan RPC dan akun program, bukan audit, kecocokan binary, atau jaminan keamanan. Pool tidak memiliki remove liquidity.</p>
-            <label className="mt-2 flex items-center gap-2"><input type="checkbox" checked={mainnetAcknowledged} disabled={isBusy || claimBusy} onChange={(e) => setMainnetAcknowledged(e.target.checked)} /> Saya memahami bahwa mainnet menggunakan dana nyata.</label>
-          </>}
-        </div>
-      )}
-
-      {/* Main Content */}
-      <main className="mx-auto grid max-w-6xl gap-6 px-5 py-7 lg:grid-cols-12">
-        {/* Left Column: Unified Form */}
-        <section className="lg:col-span-5">
-          <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 p-5 shadow-xl">
-            <div className="mb-4 flex items-center justify-between border-b border-zinc-800 pb-3">
-              <div>
-                <h2 className="text-sm font-semibold text-zinc-100">
-                  1. Token-2022 &amp; Virtual Pool Setup
-                </h2>
-                <p className="text-xs text-zinc-400">
-                  Self-Referential MetadataPointer + 0 Real SOL Init
-                </p>
-              </div>
-              <div className="inline-flex rounded-md border border-zinc-800 bg-zinc-950 p-0.5 text-[11px]">
-                <button
-                  type="button"
-                  onClick={() => setTokenStandard('TOKEN_2022')}
-                  className={`rounded px-2 py-0.5 font-mono transition ${
-                    tokenStandard === 'TOKEN_2022'
-                      ? 'bg-emerald-500/20 text-emerald-300'
-                      : 'text-zinc-500'
-                  }`}
-                >
-                  Token-2022
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setTokenStandard('SPL_LEGACY')}
-                  className={`rounded px-2 py-0.5 font-mono transition ${
-                    tokenStandard === 'SPL_LEGACY'
-                      ? 'bg-cyan-500/20 text-cyan-300'
-                      : 'text-zinc-500'
-                  }`}
-                >
-                  SPL
-                </button>
-              </div>
-            </div>
-
-            <form onSubmit={handleLaunchPlatform} className="space-y-3.5">
-              {tokenStandard === 'TOKEN_2022' ? (
-                <fieldset className="space-y-2 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3" disabled={isBusy}>
-                  <legend className="px-1 text-xs font-semibold text-amber-200">Authority token baru (Token-2022)</legend>
-                  {([
-                    ['mint', 'Mint authority', 'ON: creator bisa mencetak token tambahan.'],
-                    ['freeze', 'Freeze authority', 'ON: creator bisa membekukan akun token.'],
-                    ['metadata', 'Metadata update authority', 'ON: creator bisa mengubah metadata dan pointer.'],
-                  ] as const).map(([key, label, description]) => (
-                    <div key={key} className="flex items-center justify-between gap-3">
-                      <div><div className="text-xs text-zinc-200">{label}</div><div className="text-[11px] text-zinc-400">{description}</div></div>
-                      <button type="button" role="switch" aria-label={label} aria-checked={authoritySettings[key]}
-                        onClick={() => { setAuthoritySettings((prev) => ({ ...prev, [key]: !prev[key] })); setAuthorityAcknowledged(false); }}
-                        className={`min-w-14 rounded border px-2 py-1 text-xs font-semibold ${authoritySettings[key] ? 'border-amber-500 text-amber-300' : 'border-emerald-500 text-emerald-300'}`}>
-                        {authoritySettings[key] ? 'ON' : 'OFF'}
-                      </button>
-                    </div>
-                  ))}
-                  <p className="text-[11px] text-amber-200">OFF berlaku permanen setelah token dibuat: mint tidak bisa ditambah, freeze tidak bisa diaktifkan kembali, dan metadata serta pointer OFF tidak bisa diubah. Metadata eksternal HTTPS masih dapat berubah.</p>
-                  {(!authoritySettings.mint || !authoritySettings.freeze || !authoritySettings.metadata) && (
-                    <label className="flex items-start gap-2 text-xs text-zinc-300">
-                      <input type="checkbox" checked={authorityAcknowledged} onChange={(e) => setAuthorityAcknowledged(e.target.checked)} />
-                      Saya memahami pilihan OFF permanen untuk token baru ini.
-                    </label>
-                  )}
-                  <p className="text-[11px] text-zinc-400">Kontrol ini tidak memengaruhi token lama atau upgrade authority program; bukan jaminan bebas rug pull.</p>
-                </fieldset>
-              ) : (
-                <p className="rounded-lg border border-zinc-700 p-3 text-xs text-amber-200">Kontrol authority ini hanya tersedia untuk Token-2022. Mode SPL Legacy tetap memakai pengaturan lama.</p>
-              )}
-              <div className="grid grid-cols-3 gap-3">
-                <div className="col-span-2">
-                  <label className="mb-1 block text-xs font-medium text-zinc-300">
-                    Token Name
-                  </label>
-                  <input
-                    type="text"
-                    required
-                    maxLength={64}
-                    value={tokenName}
-                    onChange={(e) => setTokenName(e.target.value)}
-                    className="w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-zinc-100 outline-none focus:border-emerald-500"
-                  />
-                </div>
-                <div>
-                  <label className="mb-1 block text-xs font-medium text-zinc-300">
-                    Ticker
-                  </label>
-                  <input
-                    type="text"
-                    required
-                    maxLength={12}
-                    value={ticker}
-                    onChange={(e) => setTicker(e.target.value.toUpperCase())}
-                    className="w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 font-mono text-sm uppercase text-zinc-100 outline-none focus:border-emerald-500"
-                  />
-                </div>
-              </div>
-
-              <div className="rounded-lg border border-dashed border-zinc-700 bg-zinc-950/60 p-3">
-                <div className="mb-1 flex flex-wrap items-center justify-between gap-2">
-                  <label className="block text-xs font-medium text-zinc-300">
-                    Upload gambar ke IPFS (Pinata)
-                  </label>
-                  {pinataStatus && (
-                    <span
-                      className={`rounded border px-1.5 py-0.5 font-mono text-[10px] ${
-                        pinataStatus.configured
-                          ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
-                          : 'border-amber-400/40 bg-amber-400/10 text-amber-300'
-                      }`}
-                      title={pinataStatus.message}
-                    >
-                      {pinataStatus.configured ? 'PINATA SIAP' : 'BELUM DIKONFIGURASI'}
-                    </span>
-                  )}
-                </div>
-
-                <input
-                  type="file"
-                  accept="image/png,image/jpeg,image/gif,image/webp,image/svg+xml"
-                  disabled={pinataUploadBusy || isBusy}
-                  onChange={(e) => {
-                    const file = e.target.files?.[0];
-                    if (file) void handlePinataUpload(file);
-                    e.target.value = '';
-                  }}
-                  className="block w-full text-xs text-zinc-300 file:mr-3 file:cursor-pointer file:rounded-md file:border-0 file:bg-emerald-500 file:px-3 file:py-1.5 file:text-xs file:font-semibold file:text-zinc-950 disabled:opacity-50"
-                />
-
-                {pinataUploadBusy && (
-                  <p className="mt-1 text-[11px] text-amber-300">
-                    Mengunggah gambar + metadata ke IPFS...
-                  </p>
-                )}
-                {pinataUploadError && (
-                  <p className="mt-1 text-[11px] text-rose-300">{pinataUploadError}</p>
-                )}
-                {!pinataUploadError && !pinataUploadBusy && pinataStatus && !pinataStatus.configured && (
-                  <p className="mt-1 text-[11px] text-zinc-500">
-                    {pinataStatus.message} — alternatif: tempel URL hasil
-                    <code className="mx-1 text-zinc-400">npm run pinata:upload</code>
-                    ke kolom di bawah.
-                  </p>
-                )}
-                {!pinataUploadError && !pinataUploadBusy && pinataStatus?.configured && (
-                  <p className="mt-1 text-[11px] text-zinc-500">
-                    Pilih file &rarr; kedua kolom URI di bawah terisi otomatis.
-                  </p>
-                )}
-              </div>
-
-              <div>
-                <label className="mb-1 block text-xs font-medium text-zinc-300">
-                  Image URI (IPFS / HTTPS)
-                </label>
-                <input
-                  type="url"
-                  required
-                  value={imageUri}
-                  onChange={(e) => setImageUri(e.target.value)}
-                  className="w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 font-mono text-xs text-zinc-200 outline-none focus:border-emerald-500"
-                />
-                <p className="mt-1 text-[11px] text-zinc-500">
-                  URL gambar (dipakai sebagai <code>image</code> di JSON metadata).
-                </p>
-              </div>
-
-              <div>
-                <label className="mb-1 block text-xs font-medium text-zinc-300">
-                  Metadata JSON URI (opsional)
-                </label>
-                <input
-                  type="url"
-                  value={metadataUri}
-                  onChange={(e) => setMetadataUri(e.target.value)}
-                  placeholder="https://gateway.pinata.cloud/ipfs/Qm... (hasil npm run pinata:upload)"
-                  className="w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 font-mono text-xs text-emerald-200 outline-none focus:border-emerald-500"
-                />
-                <p className="mt-1 text-[11px] text-zinc-500">
-                  Jika diisi, <code>uri</code> on-chain menunjuk ke JSON ini (standar
-                  wallet/explorer). Kosongkan untuk memakai Image URI langsung.
-                </p>
-              </div>
-
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="mb-1 block text-xs font-medium text-zinc-300">
-                    Telegram (On-Chain TLV)
-                  </label>
-                  <input
-                    type="text"
-                    value={telegram}
-                    onChange={(e) => setTelegram(e.target.value)}
-                    className="w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-xs text-zinc-200 outline-none focus:border-emerald-500"
-                  />
-                </div>
-                <div>
-                  <label className="mb-1 block text-xs font-medium text-zinc-300">
-                    Twitter / X (On-Chain TLV)
-                  </label>
-                  <input
-                    type="text"
-                    value={twitter}
-                    onChange={(e) => setTwitter(e.target.value)}
-                    className="w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-xs text-zinc-200 outline-none focus:border-emerald-500"
-                  />
-                </div>
-              </div>
-
-              <div>
-                <label className="mb-1 block text-xs font-medium text-zinc-300">
-                  Total Supply (`initial_real_token_y`)
-                </label>
-                <input
-                  type="text"
-                  required
-                  value={totalSupply}
-                  onChange={(e) => setTotalSupply(e.target.value)}
-                  className="w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 font-mono text-sm text-zinc-100 outline-none focus:border-emerald-500"
-                />
-              </div>
-
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="mb-1 block text-xs font-medium text-zinc-300">
-                    Virtual SOL (`virtual_reserves_x`)
-                  </label>
-                  <input
-                    type="text"
-                    required
-                    value={virtualSolLiquidity}
-                    onChange={(e) => setVirtualSolLiquidity(e.target.value)}
-                    className="w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 font-mono text-sm text-cyan-300 outline-none focus:border-emerald-500"
-                  />
-                </div>
-                <div>
-                  <label className="mb-1 block text-xs font-medium text-zinc-300">
-                    Initial Buy SOL (Opsional)
-                  </label>
-                  <input
-                    type="text"
-                    value={initialBuySol}
-                    onChange={(e) => setInitialBuySol(e.target.value)}
-                    className="w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 font-mono text-sm text-emerald-300 outline-none focus:border-emerald-500"
-                  />
-                </div>
-              </div>
-
-              <div className="rounded-lg border border-zinc-800/80 bg-zinc-950/70 p-3 font-mono text-[11px] text-zinc-400">
-                <div className="flex justify-between">
-                  <span>Token X Program (WSOL):</span>
-                  <span className="text-zinc-200">
-                    {shortenAddress(TOKEN_PROGRAM_ID.toBase58(), 6)}
-                  </span>
-                </div>
-                <div className="mt-1 flex justify-between">
-                  <span>Token Y Program ({ticker.toUpperCase()}):</span>
-                  <span className="text-emerald-400">
-                    {shortenAddress(
-                      (tokenStandard === 'TOKEN_2022'
-                        ? TOKEN_2022_PROGRAM_ID
-                        : TOKEN_PROGRAM_ID
-                      ).toBase58(),
-                      6
-                    )}
-                  </span>
-                </div>
-              </div>
-
-              <button
-                type="submit"
-                disabled={isBusy || claimBusy || balanceBusy || walletBusy || !operationAllowed}
-                className="w-full rounded-lg bg-emerald-500 px-4 py-2.5 text-sm font-semibold text-zinc-950 shadow-lg shadow-emerald-500/10 transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                {stage === 'MINTING_TOKEN'
-                  ? 'Minting Token-2022...'
-                  : stage === 'INITIALIZING_POOL'
-                    ? 'Initializing Pool...'
-                    : stage === 'INITIAL_SWAP'
-                      ? 'Executing Initial Swap...'
-                      : stage === 'FETCHING_POOL'
-                        ? 'Fetching PoolState...'
-                        : 'Launch Token-2022 & Virtual Pool'}
-              </button>
-            </form>
-          </div>
-        </section>
-
-        {/* Right Column: Pipeline, PoolState & Swap Terminal */}
-        <section className="space-y-5 lg:col-span-7">
-          {/* Pipeline Status */}
-          <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 p-5">
-            <div className="mb-4 flex items-center justify-between gap-2">
-              <div className="flex items-center gap-2.5">
-                <span
-                  className={`h-2.5 w-2.5 rounded-full ${
-                    stage === 'SUCCESS'
-                      ? 'bg-emerald-400'
-                      : stage === 'ERROR'
-                        ? 'bg-rose-500'
-                        : isBusy
-                          ? 'animate-pulse bg-amber-400'
-                          : 'bg-zinc-600'
-                  }`}
-                />
-                <span className="text-xs font-medium text-zinc-200">
-                  {statusBanner}
-                </span>
-              </div>
-              <span className="rounded border border-zinc-800 bg-zinc-950 px-2 py-0.5 font-mono text-[11px] text-zinc-400">
-                {stage}
-              </span>
-            </div>
-
-            {errorMessage && (
-              <div className="mb-4 rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-300">
-                {errorMessage}
-              </div>
-            )}
-
-            <div className="grid gap-2 sm:grid-cols-2">
-              {steps.map((s) => (
-                <div
-                  key={s.step}
-                  className={`rounded-lg border px-3 py-2 transition ${
-                    s.status === 'done'
-                      ? 'border-emerald-500/30 bg-emerald-500/5'
-                      : s.status === 'active'
-                        ? 'border-amber-400/40 bg-amber-400/5'
-                        : s.status === 'error'
-                          ? 'border-rose-500/40 bg-rose-500/5'
-                          : 'border-zinc-800/80 bg-zinc-950/50'
-                  }`}
-                >
-                  <div className="flex items-center justify-between text-xs">
-                    <span className="truncate font-medium text-zinc-200">
-                      <span className="mr-1.5 font-mono text-zinc-500">
-                        0{s.step}
-                      </span>
-                      {s.label}
-                    </span>
-                    <span
-                      className={`ml-2 font-mono text-[10px] uppercase ${
-                        s.status === 'done'
-                          ? 'text-emerald-400'
-                          : s.status === 'active'
-                            ? 'text-amber-300'
-                            : s.status === 'error'
-                              ? 'text-rose-400'
-                              : 'text-zinc-600'
-                      }`}
-                    >
-                      {s.status}
-                    </span>
-                  </div>
-                  {s.detail && (
-                    <p className="mt-1 truncate font-mono text-[10px] text-zinc-400">
-                      {s.detail}
-                    </p>
-                  )}
-                </div>
-              ))}
-            </div>
-          </div>
-
-          {poolInfo ? (
-            <div className="space-y-5">
-              {/* Deserialized PoolState & Vault Reserves */}
-              <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 p-5">
-                <div className="mb-3 flex flex-wrap items-center justify-between gap-2 border-b border-zinc-800 pb-3">
-                  <div>
-                    <h3 className="text-sm font-semibold text-zinc-100">
-                      Deserialized <code className="text-emerald-400">PoolState</code> (281B) +{' '}
-                      <code className="text-cyan-300">TokenInterface</code> Vaults
-                    </h3>
-                    <p className="font-mono text-[11px] text-zinc-400">
-                      Saldo Dompet Anda:{' '}
-                      {userTokenBalanceRaw === null ? '—' : formatExactTokenAmount(userTokenBalanceRaw)}{' '}
-                      {ticker.toUpperCase()} &bull; LP Supply:{' '}
-                      {formatTokenAmount(poolInfo.lpSupply, 9, 2)}
-                    </p>
-                  </div>
-                  <span className="rounded-full border border-emerald-500/40 bg-emerald-500/15 px-3 py-0.5 font-mono text-[11px] text-emerald-300">
-                    {telemetry?.tokenStandard ?? 'TOKEN_2022'}
-                  </span>
-                </div>
-
-                <div className="grid gap-2.5 sm:grid-cols-2">
-                  <div className="rounded-lg border border-zinc-800 bg-zinc-950 p-3">
-                    <div className="text-[11px] text-zinc-400">
-                      vault_x.amount (Real SOL) + virtual_reserves_x
-                    </div>
-                    <div className="mt-0.5 font-mono text-sm font-semibold text-emerald-400">
-                      {formatTokenAmount(poolInfo.realReservesX, 9, 4)} +{' '}
-                      {formatTokenAmount(poolInfo.virtualReservesX, 9, 1)} ={' '}
-                      {formatTokenAmount(poolInfo.totalReservesX, 9, 4)} SOL
-                    </div>
-                  </div>
-                  <div className="rounded-lg border border-zinc-800 bg-zinc-950 p-3">
-                    <div className="text-[11px] text-zinc-400">
-                      vault_y.amount (Real {ticker.toUpperCase()})
-                    </div>
-                    <div className="mt-0.5 font-mono text-sm font-semibold text-zinc-100">
-                      {formatTokenAmount(poolInfo.realReservesY, 9, 2)}{' '}
-                      {ticker.toUpperCase()}
-                    </div>
-                  </div>
-                </div>
-
-                <div className="mt-3 grid gap-1 rounded-lg border border-zinc-800 bg-zinc-950 p-3 font-mono text-[11px]">
-                  <div className="flex justify-between gap-2">
-                    <span className="text-zinc-500">pool_state PDA (bump={poolInfo.bump}):</span>
-                    <span className="truncate text-zinc-200">
-                      {poolInfo.poolAddress.toBase58()}
-                    </span>
-                  </div>
-                  <div className="flex justify-between gap-2">
-                    <span className="text-zinc-500">token_x (WSOL / SPL):</span>
-                    <span className="truncate text-zinc-200">
-                      {poolInfo.tokenX.toBase58()}
-                    </span>
-                  </div>
-                  <div className="mt-2">
-                    <label htmlFor="token-mint-address" className="text-zinc-500">Mint token (token_y):</label>
-                    <div className="mt-1 flex gap-2">
-                      <input id="token-mint-address" readOnly value={poolInfo.tokenY.toBase58()}
-                        onFocus={(e) => e.currentTarget.select()}
-                        className="min-w-0 flex-1 rounded border border-zinc-700 bg-zinc-900 px-2 py-1 text-emerald-300" />
-                      <button type="button" onClick={() => void handleCopyMint()}
-                        className="rounded border border-emerald-500/50 px-2 py-1 text-emerald-300 hover:bg-emerald-500/15">
-                        Copy Mint
-                      </button>
-                    </div>
-                    <p role="status" className="mt-1 text-zinc-400">{copyStatus}</p>
-                  </div>
-                  <div className="flex justify-between gap-2">
-                    <span className="text-zinc-500">token_program_y:</span>
-                    <span className="truncate text-cyan-300">
-                      {poolInfo.tokenProgramY.toBase58()}
-                    </span>
-                  </div>
-                  {telemetry && telemetry.additionalMetadata.length > 0 && (
-                    <div className="flex justify-between gap-2">
-                      <span className="text-zinc-500">
-                        On-Chain TokenMetadata TLV ({telemetry.allocatedMintBytes}B):
-                      </span>
-                      <span className="truncate text-zinc-300">
-                        {telemetry.additionalMetadata
-                          .map(([k, v]) => `${k}=${v}`)
-                          .join(' | ')}
-                      </span>
-                    </div>
-                  )}
-                  {telemetry && (
-                    <div className="pt-1 text-[10px] text-zinc-500">
-                      claim_creator_fee (10B):{' '}
-                      <span className="text-amber-300">[3, side, min_amount]</span> |{' '}
-                      initialize_pool (17B):{' '}
-                      <span className="text-cyan-300">
-                        0x{telemetry.createPoolIxHex}
-                      </span>
-                      {telemetry.lastSwapIxHex && (
-                        <>
-                          {' '}
-                          | swap (18B):{' '}
-                          <span className="text-emerald-300">
-                            0x{telemetry.lastSwapIxHex}
-                          </span>
-                        </>
-                      )}
-                    </div>
-                  )}
-                </div>
-
-                {/* Fee Creator — 0.06% dari setiap swap (LP 0.24%) */}
-                <div className="mt-3 rounded-lg border border-amber-500/25 bg-amber-500/5 p-3">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div className="text-[11px] text-zinc-400">
-                      <span className="font-semibold text-amber-300">Fee Creator</span>{' '}
-                      0.06% per swap &bull; terakumulasi di{' '}
-                      <code className="text-zinc-300">fee_vault_x/y</code>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => void handleClaimCreatorFee()}
-                      disabled={
-                        claimBusy || isBusy || !operationAllowed || poolMode !== executionMode ||
-                        !poolInfo ||
-                        (poolInfo.creatorFeeX === 0n && poolInfo.creatorFeeY === 0n)
-                      }
-                      className="rounded-md border border-amber-500/50 bg-amber-500/15 px-2.5 py-1 text-[11px] font-medium text-amber-200 transition hover:bg-amber-500/25 disabled:cursor-not-allowed disabled:opacity-40"
-                    >
-                      {claimBusy ? 'Mengklaim…' : 'Claim Fee'}
-                    </button>
-                  </div>
-                  <div className="mt-2 grid gap-1 font-mono text-[11px] text-zinc-300">
-                    <div className="flex justify-between gap-2">
-                      <span className="text-zinc-500">Siap diklaim X (SOL):</span>
-                      <span className="text-emerald-300">
-                        {formatTokenAmount(poolInfo.creatorFeeX, 9, 6)}
-                      </span>
-                    </div>
-                    <div className="flex justify-between gap-2">
-                      <span className="text-zinc-500">
-                        Siap diklaim Y ({ticker.toUpperCase()}):
-                      </span>
-                      <span className="text-emerald-300">
-                        {formatTokenAmount(poolInfo.creatorFeeY, 9, 6)}
-                      </span>
-                    </div>
-                    <div className="flex justify-between gap-2">
-                      <span className="text-zinc-500">creator:</span>
-                      <span className="truncate text-zinc-400">
-                        {shortenAddress(poolInfo.creator.toBase58(), 6)}
-                      </span>
-                    </div>
-                  </div>
-                  <p className="mt-2 text-[10px] text-zinc-500">
-                    CLI: <code className="text-zinc-400">npm run claim:creator -- --pool{' '}
-                    {shortenAddress(poolInfo.poolAddress.toBase58(), 6)}</code>
-                  </p>
-                </div>
-              </div>
-
-              {/* Swap Terminal (`transfer_checked`) */}
-              <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 p-5">
-                <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-                  <h3 className="text-sm font-semibold text-zinc-100">
-                    2. Swap Terminal (<code className="text-emerald-400">transfer_checked</code>, 0.3% Fee)
-                  </h3>
-                  <div className="inline-flex rounded-lg border border-zinc-800 bg-zinc-950 p-0.5 text-xs">
-                    <button
-                      type="button"
-                      disabled={balanceBusy || isBusy}
-                      onClick={() => {
-                        setTradeSide('BUY');
-                        setTradeAmountInput('5');
-                      }}
-                      className={`rounded-md px-3 py-1 font-semibold transition ${
-                        tradeSide === 'BUY'
-                          ? 'bg-emerald-500 text-zinc-950'
-                          : 'text-zinc-400 hover:text-zinc-200'
-                      }`}
-                    >
-                      Beli (SOL &rarr; {ticker.toUpperCase()})
-                    </button>
-                    <button
-                      type="button"
-                      disabled={balanceBusy || isBusy}
-                      onClick={() => {
-                        setTradeSide('SELL');
-                        setTradeAmountInput('10000000');
-                      }}
-                      className={`rounded-md px-3 py-1 font-semibold transition ${
-                        tradeSide === 'SELL'
-                          ? 'bg-rose-500 text-zinc-950'
-                          : 'text-zinc-400 hover:text-zinc-200'
-                      }`}
-                    >
-                      Jual ({ticker.toUpperCase()} &rarr; SOL)
-                    </button>
-                  </div>
-                </div>
-
-                <div className="grid items-end gap-3 sm:grid-cols-2">
-                  <div>
-                    <label className="mb-1 block text-xs text-zinc-400">
-                      Jumlah Input (
-                      {tradeSide === 'BUY' ? 'SOL' : ticker.toUpperCase()})
-                    </label>
-                    <div className="mb-1 flex justify-end">
-                      <button type="button" onClick={() => void handleSellAll()}
-                        disabled={isBusy || claimBusy || balanceBusy || !rpcReady || poolMode !== executionMode}
-                        className="rounded border border-rose-500/50 px-2 py-1 text-xs font-semibold text-rose-300 hover:bg-rose-500/15 disabled:opacity-50">
-                        {balanceBusy ? 'Membaca saldo…' : 'SELL ALL'}
-                      </button>
-                    </div>
-                    <input
-                      type="text"
-                      disabled={balanceBusy || isBusy}
-                      value={tradeAmountInput}
-                      onChange={(e) => setTradeAmountInput(e.target.value)}
-                      className="w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 font-mono text-sm text-zinc-100 outline-none focus:border-emerald-500"
-                    />
-                  </div>
-                  <div className="rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2">
-                    <div className="text-[11px] text-zinc-400">
-                      Output Estimasi (Virtual + Real Curve)
-                    </div>
-                    <div className="font-mono text-sm font-semibold text-emerald-400">
-                      {swapQuote
-                        ? `${formatTokenAmount(
-                            swapQuote.amountOut,
-                            9,
-                            4
-                          )} ${tradeSide === 'BUY' ? ticker.toUpperCase() : 'SOL'}`
-                        : '—'}
-                    </div>
-                  </div>
-                </div>
-
-                {balanceError && <p role="alert" className="mt-2 text-xs text-rose-300">Gagal membaca saldo: {balanceError}. Coba tekan SELL ALL lagi.</p>}
-                {poolMode !== executionMode && <p className="mt-2 text-xs text-amber-300">Pool dibuat di mode {poolMode}. Kembali ke mode tersebut untuk swap.</p>}
-                {tradeSide === 'SELL' && !swapQuote && <p className="mt-2 text-xs text-amber-300">Estimasi tidak tersedia: periksa jumlah, output minimum, dan cadangan SOL riil pool.</p>}
-                <button
-                  type="button"
-                  disabled={!swapQuote || isBusy || claimBusy || balanceBusy || !operationAllowed || poolMode !== executionMode}
-                  onClick={handleExecuteSwap}
-                  className={`mt-3 w-full rounded-lg px-4 py-2 text-xs font-semibold transition disabled:opacity-50 ${
-                    tradeSide === 'BUY'
-                      ? 'bg-emerald-500 text-zinc-950 hover:bg-emerald-400'
-                      : 'bg-rose-500 text-zinc-950 hover:bg-rose-400'
-                  }`}
-                >
-                  {stage === 'SWAPPING'
-                    ? 'Memproses transfer_checked Swap...'
-                    : tradeSide === 'BUY'
-                      ? `Beli $${ticker.toUpperCase()} (Token-2022)`
-                      : `Jual $${ticker.toUpperCase()} ke SOL`}
-                </button>
-              </div>
-            </div>
-          ) : (
-            <div className="rounded-xl border border-dashed border-zinc-800 bg-zinc-900/30 p-8 text-center">
-              <p className="font-mono text-xs text-zinc-400">
-                Klik <strong>Launch Token-2022 &amp; Virtual Pool</strong> untuk
-                membuat Mint Token-2022 dengan ekstensi{' '}
-                <code className="text-zinc-200">MetadataPointer</code> +{' '}
-                <code className="text-zinc-200">TokenMetadata</code> dan
-                menginisialisasi Virtual Liquidity AMM.
-              </p>
-            </div>
-          )}
-        </section>
-      </main>
-    </div>
-  );
+        <div className={`${card} space-y-3`}><h2 className="font-semibold">Swap</h2><div className="flex gap-2"><button type="button" className={button} onClick={() => setSide('BUY')}>Beli SOL → token</button><button type="button" className={button} onClick={() => setSide('SELL')}>Jual token → SOL</button></div><p className="text-xs">Sisi: {side}</p><label className={label} htmlFor="amount">Jumlah {side === 'BUY' ? 'SOL' : 'token'}</label><input id="amount" className={input} value={amount} onChange={(e) => setAmount(e.target.value)} /><button type="button" className={button} disabled={busy || !pool || !connected || !riskAccepted} onClick={() => void sellAll()}>SELL ALL</button><label className={label} htmlFor="slippage">Slippage maksimum (%)</label><input id="slippage" className={input} value={slippage} onChange={(e) => setSlippage(e.target.value)} /><p className="text-xs text-zinc-300">Estimasi output: {quote ? formatExactTokenAmount(quote.out) : '—'} · Minimum: {quote ? formatExactTokenAmount(quote.minOut) : '—'}</p><p className="text-xs text-amber-300">Jual menutup ATA WSOL dan mencairkan seluruh saldo WSOL ATA tersebut ke SOL. Pool dengan cadangan SOL riil kecil dapat menolak penjualan.</p><button type="button" className={button} disabled={busy || !connected || !networkReady || !riskAccepted || !quote} onClick={() => void executeSwap()}>{side === 'BUY' ? 'Beli' : 'Jual'} via wallet</button></div></section>
+      </div>
+    </main>
+  </div>;
 }

@@ -90,6 +90,7 @@ async function main(): Promise<void> {
 
   // 3. Uji Clone Token-2022 + Native MetadataPointer + TokenMetadata + UpdateField (Telegram & Twitter)
   const clone = await sdk.buildCloneTokenInstructions({
+    mint: Keypair.generate().publicKey,
     payer: payer.publicKey,
     name: 'Nusantara Token 2022',
     symbol: 'NUSA',
@@ -154,6 +155,7 @@ async function main(): Promise<void> {
   const metadataJsonUri =
     'https://nusantara-gateway.mypinata.cloud/ipfs/QmMetadataHashUji1234567890abcdefghijklmnopqrstuvwxyz';
   const cloneWithJson = await sdk.buildCloneTokenInstructions({
+    mint: Keypair.generate().publicKey,
     payer: payer.publicKey,
     name: 'Nusantara Token 2022',
     symbol: 'NUSA',
@@ -187,6 +189,7 @@ async function main(): Promise<void> {
   // 3c. Mode kompatibilitas SPL Legacy: instruksi MintToChecked tetap 3 akun,
   //     hanya program pemiliknya yang berbeda (Tokenkeg…).
   const cloneLegacy = await sdk.buildCloneTokenInstructions({
+    mint: Keypair.generate().publicKey,
     payer: payer.publicKey,
     name: 'Nusantara Legacy',
     symbol: 'NUSA',
@@ -207,6 +210,7 @@ async function main(): Promise<void> {
     for (const freezeEnabled of [false, true]) {
       for (const metadataEnabled of [false, true]) {
         const configured = await sdk.buildCloneTokenInstructions({
+          mint: Keypair.generate().publicKey,
           payer: payer.publicKey,
           name: 'Nusantara Token 2022', symbol: 'NUSA',
           imageUri: clone.offchainMetadataJson.image,
@@ -242,7 +246,7 @@ async function main(): Promise<void> {
     }
   }
   await assert.rejects(sdk.buildCloneTokenInstructions({
-    payer: payer.publicKey, name: 'Legacy', symbol: 'LEG', imageUri: clone.offchainMetadataJson.image,
+    mint: Keypair.generate().publicKey, payer: payer.publicKey, name: 'Legacy', symbol: 'LEG', imageUri: clone.offchainMetadataJson.image,
     initialSupplyRaw: supplyRaw, tokenStandard: 'SPL_LEGACY',
     authorities: { mint: false, freeze: false, metadata: false },
   }), /hanya mendukung Token-2022/);
