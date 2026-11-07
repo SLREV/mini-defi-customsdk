@@ -5,7 +5,7 @@
  * Tidak butuh Rust/Solana: seluruh parsing diuji terhadap string output nyata.
  */
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -15,6 +15,7 @@ import {
   compareVersion,
   formatVersion,
   encodeBase58,
+  findFiles,
   inspectToolchain,
   parseDeclareId,
   parseSdkProgramId,
@@ -245,7 +246,45 @@ assert.equal(
   'tanpa target/deploy tidak boleh ada mismatch palsu'
 );
 
-// 10. Repo asli: konfigurasi yang dikomit memang MSRV-aware
+// 10. Bundle `dist/` basi: kalau masih memuat program ID lama, `npm run preview`
+//     akan menyajikan kode lama -> dashboard menembak alamat yang salah.
+const distRoot = mkdtempSync(join(tmpdir(), 'doctor-dist-'));
+mkdirSync(join(distRoot, 'src', 'sdk'), { recursive: true });
+mkdirSync(join(distRoot, 'programs', 'mini-amm', 'src'), { recursive: true });
+mkdirSync(join(distRoot, 'dist', 'assets'), { recursive: true });
+writeFileSync(join(distRoot, 'Cargo.toml'), '[workspace]\nresolver = "2"\n');
+writeFileSync(
+  join(distRoot, 'programs', 'mini-amm', 'src', 'lib.rs'),
+  `declare_id!("${realDeployed}");\n`
+);
+writeFileSync(
+  join(distRoot, 'src', 'sdk', 'customSdk.ts'),
+  `export const DEFAULT_AMM_PROGRAM_ID = new PublicKey(\n  AMM_PROGRAM_ID_OVERRIDE || '${realDeployed}'\n);\n`
+);
+
+// (a) dist memuat ID lama -> basi
+writeFileSync(
+  join(distRoot, 'dist', 'assets', 'index-old.js'),
+  'const A="Csre71k9LDyYGx4t2hiG6VT4wiymuhPVXeksqe6Z83Hp";'
+);
+assert.equal(inspectToolchain(distRoot).distStale, true, 'dist ID lama harus terdeteksi basi');
+
+// (b) dist memuat ID yang benar -> tidak basi
+writeFileSync(join(distRoot, 'dist', 'assets', 'index-new.js'), `const A="${realDeployed}";`);
+rmSync(join(distRoot, 'dist', 'assets', 'index-old.js'));
+assert.equal(inspectToolchain(distRoot).distStale, false, 'dist ID benar tidak boleh ditandai');
+
+// (c) tanpa dist -> tidak ada laporan palsu
+rmSync(join(distRoot, 'dist'), { recursive: true, force: true });
+assert.equal(inspectToolchain(distRoot).distStale, false, 'tanpa dist tidak boleh ada laporan');
+
+// (d) findFiles hanya mengambil .js di dalam subdirektori
+mkdirSync(join(distRoot, 'dist', 'assets'), { recursive: true });
+writeFileSync(join(distRoot, 'dist', 'assets', 'a.js'), 'x');
+writeFileSync(join(distRoot, 'dist', 'assets', 'b.css'), 'x');
+assert.equal(findFiles(join(distRoot, 'dist'), /\.js$/).length, 1);
+
+// 11. Repo asli: konfigurasi yang dikomit memang MSRV-aware
 const repo = inspectToolchain(REPO);
 assert.equal(repo.resolver, '2', 'Cargo.toml root wajib resolver = "2" (Anchor 0.31.1 menolak "3")');
 assert.equal(

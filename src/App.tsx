@@ -127,7 +127,7 @@ const describeRpcError = (err: unknown, rpcEndpoint: string): string => {
       haystack
     )
   ) {
-    return `Program AMM ${DEFAULT_AMM_PROGRAM_ID.toBase58()} belum ter-deploy di ${rpcEndpoint}. Jalankan "anchor build && anchor deploy --provider.cluster devnet" terlebih dahulu.`;
+    return `Program AMM ${DEFAULT_AMM_PROGRAM_ID.toBase58()} belum ter-deploy di ${rpcEndpoint}. Jalankan "anchor build && anchor deploy --provider.cluster devnet" terlebih dahulu. (build ${SDK_BUILD_TAG} — kalau ID di atas bukan program yang baru Anda deploy, browser masih memuat bundle lama: tekan Ctrl+Shift+R atau jalankan "npm run build" ulang.)`;
   }
   // Anchor ErrorCode 4100 / custom error 0x1004: binary yang ter-deploy
   // dikompilasi dengan declare_id! berbeda dari alamat tempat ia di-deploy.

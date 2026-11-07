@@ -573,6 +573,38 @@ Setelah itu `npm run dev` → mode **Devnet RPC** siap dipakai.
 > `anchor clean && anchor build`. `npm run toolchain:check` akan menandai kalau ada yang
 > tertinggal.
 
+### Dashboard masih memakai program ID lama (bundle basi)
+
+Kalau pesan error di browser masih menyebut alamat lama padahal `declare_id!` dan program
+sudah benar, berarti **browser menjalankan kode lama**, bukan program yang salah.
+
+Penyebab yang paling sering, berurutan:
+
+1. **Server dev dijalankan sebelum file diubah.** Vite hanya membaca ulang file saat start;
+   `src/sdk/customSdk.ts` yang berubah setelah `npm run dev` tidak ikut terpakai.
+   → Hentikan (`Ctrl+C`) lalu jalankan `npm run dev` lagi.
+2. **Halaman tidak reload.** Vite HMR kadang tidak mengganti modul SDK karena ia di-import
+   di level teratas. → `Ctrl+Shift+R` (hard reload).
+3. **`npm run preview` / server statis menyajikan `dist/` lama.** → `npm run build` ulang,
+   atau hapus `dist/`.
+
+Cara memastikan dalam sekali lihat: header dashboard menampilkan stempel build
+
+```
+build 2026.11.07 · creatorFee=6bps · mintToChecked=3akun · programId=DnW4iMWC5
+```
+
+Kalau **`programId=` masih ID lama** (atau stempelnya tidak memuat `programId=` sama sekali),
+browser Anda jelas memakai source basi. Pesan error transaksi juga menyertakan stempel ini.
+
+Dari terminal, periksa tanpa membuka browser:
+
+```bash
+npm run toolchain:check     # baris "dist (bundle): ok / BASI"
+```
+
+`BASI` berarti ada file `.js` di `dist/` yang tidak memuat program ID aktif.
+
 ### Kalau memilih deploy baru (bukan upgrade)
 
 ```bash

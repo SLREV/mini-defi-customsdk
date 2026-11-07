@@ -18,7 +18,7 @@
  *   npm run toolchain:check -- --json
  */
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 /** Edition 2024 stabil sejak rustc 1.85 — di bawah ini manifest gagal di-parse. */
@@ -169,8 +169,23 @@ export interface ToolchainReport {
   programIdMismatch: boolean;
   /** true bila declare_id! tidak sama dengan program ID yang dipanggil dashboard. */
   declareIdStale: boolean;
+  /** true bila `dist/` ada tapi berisi program ID lama (browser akan pakai ID basi). */
+  distStale: boolean;
   binary: string | null;
   hints: string[];
+}
+
+/** Kumpulkan file di dalam `dir` (rekursif) yang cocok dengan `pattern`. */
+export function findFiles(dir: string, pattern: RegExp, acc: string[] = []): string[] {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      findFiles(full, pattern, acc);
+    } else if (pattern.test(entry.name)) {
+      acc.push(full);
+    }
+  }
+  return acc;
 }
 
 /** Jalankan perintah, kembalikan stdout+stderr atau `null` bila tidak ada. */
@@ -362,6 +377,28 @@ export function inspectToolchain(root = process.cwd()): ToolchainReport {
     );
   }
 
+  // Bundle hasil build (`dist/`) bisa tertinggal setelah program ID berubah.
+  // Kalau ia masih memuat ID lama, `npm run preview` akan memakai ID basi.
+  const distDir = join(root, 'dist');
+  let distStale = false;
+  if (existsSync(distDir) && effectiveProgramId) {
+    for (const asset of findFiles(distDir, /\.[cm]?js$/)) {
+      const text = readFileSync(asset, 'utf8');
+      if (!text.includes(effectiveProgramId)) {
+        distStale = true;
+        break;
+      }
+    }
+  }
+  if (distStale) {
+    hints.push(
+      'dist/ berisi bundle LAMA (program ID di dalamnya bukan ' +
+        effectiveProgramId +
+        '). Jalankan `npm run build` ulang, atau hapus dist/ — kalau tidak, ' +
+        '`npm run preview`/server statis akan memakai ID basi.'
+    );
+  }
+
   hints.push(
     binary
       ? `Binary siap deploy: ${binary}`
@@ -384,6 +421,7 @@ export function inspectToolchain(root = process.cwd()): ToolchainReport {
     deployKeypairPubkey,
     programIdMismatch,
     declareIdStale,
+    distStale,
     binary,
     hints,
   };
@@ -426,6 +464,7 @@ function main(): void {
   console.log(
     `Resolver MSRV   : ${report.msrvAwareResolver ? 'aktif' : `belum (resolver=${report.resolver ?? '-'})`}`
   );
+  console.log(`dist (bundle)   : ${report.distStale ? '\u2716 BASI — jalankan npm run build' : 'ok / belum ada'}`);
   console.log(`declare_id!     : ${report.declareId ?? 'tidak terbaca'}`);
   console.log(
     `SDK / .env      : ${report.envAmmProgramId ?? report.sdkProgramId ?? 'tidak terbaca'}` +

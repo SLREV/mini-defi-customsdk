@@ -86,8 +86,12 @@ export const TOKEN_2022_MINT_METADATA_POINTER_SIZE = 234;
  * Stempel versi layout instruksi SDK. Ditampilkan di header dashboard supaya
  * bisa dipastikan browser benar-benar menjalankan kode terbaru (bukan bundle lama),
  * mis. setelah perbaikan layout `MintToChecked` (3 akun, bukan 4).
+ *
+ * `programId=<8 karakter pertama>` memudahkan membedakan bundle lama vs baru:
+ * kalau header masih menampilkan ID lama, browser menyajikan source basi.
  */
-export const SDK_BUILD_TAG = '2026.11.06 · creatorFee=6bps · mintToChecked=3akun';
+export const SDK_BUILD_TAG =
+  '2026.11.07 · creatorFee=6bps · mintToChecked=3akun · programId=DnW4iMWC5';
 
 /**
  * Ukuran akun `PoolState` di `programs/mini-amm/src/lib.rs`:
