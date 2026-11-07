@@ -4,7 +4,7 @@
   "version": "1.0.0",
   "type": "module",
   "engines": {
-    "node": ">=18.0.0",
+    "node": "^22.13.0 || ^24.3.0 || >=26.0.0",
     "npm": ">=9.0.0"
   },
   "scripts": {
@@ -12,19 +12,16 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview --host 0.0.0.0 --port 4173",
     "typecheck": "tsc --noEmit",
-    "test": "tsx tests/verifySdk.ts && tsx tests/verifyPinata.ts && tsx tests/verifyPinataApi.ts && tsx tests/verifyClaimCreator.ts && tsx tests/verifyToolchain.ts && tsx tests/verifyTradeUtils.ts && tsx tests/verifyNetwork.ts && tsx tests/verifyLocalValidator.ts && tsx tests/verifyLocalProxy.ts",
+    "test": "tsx tests/verifySdk.ts && tsx tests/verifyPinata.ts && tsx tests/verifyPinataApi.ts && tsx tests/verifyTradeUtils.ts && tsx tests/verifyMainnet.ts",
     "anchor:build": "anchor build",
-    "anchor:deploy": "anchor deploy --provider.cluster devnet",
-    "toolchain:check": "tsx scripts/toolchainDoctor.ts",
-    "devnet:check": "tsx scripts/devnetPreflight.ts",
     "pinata:upload": "tsx scripts/pinataUpload.ts",
     "pinata:check": "tsx scripts/pinataUpload.ts --check",
-    "claim:creator": "tsx --env-file-if-exists=.env scripts/claimCreatorFee.ts",
-    "dev:private": "vite --host 127.0.0.1 --port 5173",
-    "local:validator": "bash scripts/localValidator.sh"
+    "dev:private": "vite --host 127.0.0.1 --port 5173"
   },
   "dependencies": {
     "@solana/buffer-layout": "^4.0.1",
+    "@solana/wallet-adapter-phantom": "0.9.24",
+    "@solana/wallet-adapter-react": "0.15.35",
     "@solana/web3.js": "^1.98.0",
     "buffer": "^6.0.3",
     "react": "^18.3.1",
@@ -32,7 +29,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
-    "@types/react": "^18.3.18",
+    "@types/react": "18.3.31",
     "@types/react-dom": "^18.3.5",
     "@vitejs/plugin-react": "^4.3.4",
     "autoprefixer": "^10.4.20",
@@ -41,5 +38,10 @@
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
     "vite": "^6.0.5"
+  },
+  "overrides": {
+    "@types/react": "18.3.31",
+    "@solana-mobile/wallet-adapter-mobile": "2.0.1",
+    "@solana/wallet-standard-wallet-adapter-react": "1.1.0"
   }
 }

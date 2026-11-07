@@ -8,5 +8,3 @@ target/
 .env.*
 !.env.example
 pinata-upload-result.json
-
-.local-validator/
