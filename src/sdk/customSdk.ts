@@ -461,6 +461,8 @@ export interface CloneTokenParams {
   /** Default: `'TOKEN_2022'` (menggunakan Native MetadataPointer + TokenMetadata Extensions) */
   tokenStandard?: TokenStandardMode;
   freezeAuthority?: PublicKey | null;
+  /** Opt-in controls for new Token-2022 mints. OFF is irreversible. */
+  authorities?: { mint: boolean; freeze: boolean; metadata: boolean };
 }
 
 export interface CloneTokenBuildResult {
@@ -937,7 +939,7 @@ export class CustomDefiSDK {
    */
   public buildInitializeMetadataPointerInstruction(
     mint: PublicKey,
-    updateAuthority: PublicKey,
+    updateAuthority: PublicKey | null,
     metadataAddress: PublicKey = mint
   ): TransactionInstruction {
     const data = Buffer.alloc(METADATA_POINTER_INIT_LAYOUT.span);
@@ -945,7 +947,7 @@ export class CustomDefiSDK {
       {
         extension: SPL_TOKEN_IX.METADATA_POINTER_EXTENSION, // 39
         instruction: 0, // Initialize
-        authority: updateAuthority,
+        authority: updateAuthority ?? PublicKey.default,
         metadataAddress,
       },
       data
@@ -1050,6 +1052,30 @@ export class CustomDefiSDK {
       programId: TOKEN_2022_PROGRAM_ID,
       keys,
       data,
+    });
+  }
+
+  /** SPL SetAuthority: MintTokens (0) -> None; after initial MintToChecked. */
+  public buildRevokeMintAuthorityInstruction(mint: PublicKey, authority: PublicKey): TransactionInstruction {
+    return new TransactionInstruction({
+      programId: TOKEN_2022_PROGRAM_ID,
+      keys: [
+        { pubkey: mint, isSigner: false, isWritable: true },
+        { pubkey: authority, isSigner: true, isWritable: false },
+      ],
+      data: Buffer.from([6, 0, 0]), // SetAuthority, MintTokens, COption::None
+    });
+  }
+
+  /** Token metadata interface UpdateAuthority -> None (all-zero OptionalNonZeroPubkey). */
+  public buildRevokeTokenMetadataAuthorityInstruction(mint: PublicKey, authority: PublicKey): TransactionInstruction {
+    return new TransactionInstruction({
+      programId: TOKEN_2022_PROGRAM_ID,
+      keys: [
+        { pubkey: mint, isSigner: false, isWritable: true },
+        { pubkey: authority, isSigner: true, isWritable: false },
+      ],
+      data: Buffer.concat([Buffer.from([215, 228, 166, 228, 84, 100, 86, 123]), Buffer.alloc(32)]),
     });
   }
 
@@ -1219,6 +1245,9 @@ export class CustomDefiSDK {
     const mint = mintKeypair.publicKey;
     const decimals = params.decimals ?? DEFAULT_TOKEN_DECIMALS;
     const tokenStandard: TokenStandardMode = params.tokenStandard ?? 'TOKEN_2022';
+    if (tokenStandard !== 'TOKEN_2022' && params.authorities) {
+      throw new Error('Kontrol authority baru hanya mendukung Token-2022');
+    }
     const tokenProgramId =
       tokenStandard === 'TOKEN_2022' ? TOKEN_2022_PROGRAM_ID : TOKEN_PROGRAM_ID;
 
@@ -1279,7 +1308,9 @@ export class CustomDefiSDK {
 
       // 2. Inisialisasi ekstensi MetadataPointer menunjuk ke akun Mint itu sendiri
       instructions.push(
-        this.buildInitializeMetadataPointerInstruction(mint, params.payer, mint)
+        this.buildInitializeMetadataPointerInstruction(
+          mint, params.authorities?.metadata === false ? null : params.payer, mint
+        )
       );
 
       // 3. Inisialisasi Mint Token-2022 (`InitializeMint2`)
@@ -1288,7 +1319,7 @@ export class CustomDefiSDK {
           mint,
           decimals,
           params.payer,
-          params.freezeAuthority ?? null,
+          params.authorities ? (params.authorities.freeze ? params.payer : null) : (params.freezeAuthority ?? null),
           TOKEN_2022_PROGRAM_ID
         )
       );
@@ -1336,6 +1367,15 @@ export class CustomDefiSDK {
             TOKEN_2022_PROGRAM_ID
           )
         );
+      }
+
+      // Preserve ordering: initialize metadata + social fields and mint the initial supply
+      // before revoking either authority. Instructions are atomic in the mint transaction.
+      if (params.authorities?.metadata === false) {
+        instructions.push(this.buildRevokeTokenMetadataAuthorityInstruction(mint, params.payer));
+      }
+      if (params.authorities?.mint === false) {
+        instructions.push(this.buildRevokeMintAuthorityInstruction(mint, params.payer));
       }
 
       return {

@@ -77,6 +77,16 @@ Anchor 0.31 mendukung **custom discriminator** 1 byte (`#[instruction(discrimina
 └── vite.config.ts
 ```
 
+## Authority token baru (Token-2022)
+
+Dashboard menyediakan sakelar **ON/OFF** untuk mint, freeze, dan metadata update authority pada token Token-2022 yang baru dibuat. Default ketiganya OFF; pengguna harus menyetujui bahwa OFF permanen sebelum launch. ON memberi authority tersebut kepada wallet pembuat. Pilihan ini tidak mengubah token yang sudah dibuat, tidak mengubah upgrade authority program, dan tidak menjamin bebas rug pull. Mode SPL Legacy tidak mendukung kontrol ini dan mempertahankan perilaku sebelumnya.
+
+- **Mint OFF**: supply awal dicetak dahulu, kemudian mint authority dilepas dalam transaksi pembuatan mint yang sama.
+- **Freeze OFF**: mint diinisialisasi tanpa freeze authority.
+- **Metadata OFF**: metadata dan sosial ditulis dahulu, kemudian update authority dilepas; MetadataPointer diinisialisasi tanpa authority agar tidak dapat dialihkan. Konten yang dihosting lewat HTTPS di luar chain bisa saja berubah meskipun URI on-chain terkunci.
+
+Transaksi dibuat atomik; jika terlalu besar, pendekkan nama, URI, atau metadata sosial. Uji transaksi dan verifikasi authority di devnet sebelum penggunaan dengan dana nyata. **Sakelar ini tidak menambahkan mode mainnet**; dukungan mainnet dan kesiapan keamanan masih perlu pekerjaan tersendiri.
+
 ## Upload Gambar & Metadata ke IPFS via Pinata
 
 Script otomatis `scripts/pinataUpload.ts` mengunggah **gambar token** lalu **JSON metadata**

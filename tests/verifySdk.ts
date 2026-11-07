@@ -5,6 +5,8 @@ import {
   Connection,
   Keypair,
   PublicKey,
+  Transaction,
+  ComputeBudgetProgram,
 } from '@solana/web3.js';
 import {
   ADD_LIQUIDITY_IX_LAYOUT,
@@ -199,6 +201,51 @@ async function main(): Promise<void> {
   assert.equal(legacyMintToIx.keys.length, 3);
   assert.equal(legacyMintToIx.programId.toBase58(), TOKEN_PROGRAM_ID.toBase58());
   assert.equal(legacyMintToIx.keys[1].pubkey.toBase58(), cloneLegacy.userTokenAta.toBase58());
+
+  // New Token-2022 authority switches: test all eight configurations and ordering.
+  for (const mintEnabled of [false, true]) {
+    for (const freezeEnabled of [false, true]) {
+      for (const metadataEnabled of [false, true]) {
+        const configured = await sdk.buildCloneTokenInstructions({
+          payer: payer.publicKey,
+          name: 'Nusantara Token 2022', symbol: 'NUSA',
+          imageUri: clone.offchainMetadataJson.image,
+          telegram: 'https://t.me/nusa_2022', twitter: 'https://x.com/nusa_2022',
+          initialSupplyRaw: supplyRaw, tokenStandard: 'TOKEN_2022',
+          authorities: { mint: mintEnabled, freeze: freezeEnabled, metadata: metadataEnabled },
+        });
+        const instructions = configured.instructions;
+        // MetadataPointer bytes 2..34 contain optional authority: zero = None.
+        assert.deepEqual(instructions[1].data.subarray(2, 34),
+          metadataEnabled ? payer.publicKey.toBuffer() : Buffer.alloc(32));
+        assert.equal(instructions[2].data[34], freezeEnabled ? 1 : 0);
+        assert.deepEqual(instructions[2].data.subarray(35, 67),
+          freezeEnabled ? payer.publicKey.toBuffer() : Buffer.alloc(32));
+        const mintIndex = instructions.findIndex((ix) => ix.programId.equals(TOKEN_2022_PROGRAM_ID) && ix.data[0] === 14 && ix.data.length === 10);
+        const revokeMintIndex = instructions.findIndex((ix) => ix.programId.equals(TOKEN_2022_PROGRAM_ID) && ix.data.equals(Buffer.from([6, 0, 0])));
+        const revokeMetadataIndex = instructions.findIndex((ix) => ix.programId.equals(TOKEN_2022_PROGRAM_ID) && ix.data.equals(Buffer.concat([Buffer.from([215, 228, 166, 228, 84, 100, 86, 123]), Buffer.alloc(32)])));
+        assert(mintIndex >= 0);
+        assert.equal(revokeMintIndex >= 0, !mintEnabled);
+        assert.equal(revokeMetadataIndex >= 0, !metadataEnabled);
+        if (revokeMintIndex >= 0) assert(revokeMintIndex > mintIndex);
+        if (revokeMetadataIndex >= 0) {
+          assert(revokeMetadataIndex > mintIndex);
+          assert.equal(instructions[revokeMetadataIndex].keys[0].pubkey.toBase58(), configured.mint.toBase58());
+          assert.equal(instructions[revokeMetadataIndex].keys[1].pubkey.toBase58(), payer.publicKey.toBase58());
+          assert.equal(instructions[revokeMetadataIndex].keys[1].isSigner, true);
+        }
+        const tx = new Transaction().add(ComputeBudgetProgram.setComputeUnitLimit({ units: 600_000 }), ...instructions);
+        tx.feePayer = payer.publicKey;
+        tx.recentBlockhash = Keypair.generate().publicKey.toBase58();
+        assert(tx.serialize({ requireAllSignatures: false, verifySignatures: false }).length <= 1232);
+      }
+    }
+  }
+  await assert.rejects(sdk.buildCloneTokenInstructions({
+    payer: payer.publicKey, name: 'Legacy', symbol: 'LEG', imageUri: clone.offchainMetadataJson.image,
+    initialSupplyRaw: supplyRaw, tokenStandard: 'SPL_LEGACY',
+    authorities: { mint: false, freeze: false, metadata: false },
+  }), /hanya mendukung Token-2022/);
 
   // 4. Uji buildCreatePoolTx (Discriminator 0, 17B payload, 15 AccountMeta lintas TokenProgram)
   const createPool = await sdk.buildCreatePoolTx({
