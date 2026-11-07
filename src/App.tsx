@@ -286,6 +286,9 @@ export default function App(): React.ReactElement {
     useState<TokenStandardMode>('TOKEN_2022');
   const [tokenName, setTokenName] = useState<string>('Nusantara Token 2022');
   const [ticker, setTicker] = useState<string>('NUSA');
+  // Defaults are OFF for newly created Token-2022 mints; revocation is permanent.
+  const [authoritySettings, setAuthoritySettings] = useState({ mint: false, freeze: false, metadata: false });
+  const [authorityAcknowledged, setAuthorityAcknowledged] = useState(false);
   const [imageUri, setImageUri] = useState<string>(
     'https://ipfs.io/ipfs/bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy'
   );
@@ -879,6 +882,11 @@ export default function App(): React.ReactElement {
   ): Promise<void> => {
     e.preventDefault();
     setErrorMessage(null);
+    if (tokenStandard === 'TOKEN_2022' && !authorityAcknowledged &&
+        (!authoritySettings.mint || !authoritySettings.freeze || !authoritySettings.metadata)) {
+      setErrorMessage('Konfirmasi bahwa authority OFF bersifat permanen sebelum membuat token.');
+      return;
+    }
 
     const activePayer = walletPubkey ?? ephemeralKeypair.publicKey;
     if (!walletPubkey) {
@@ -980,6 +988,7 @@ export default function App(): React.ReactElement {
         decimals: DEFAULT_TOKEN_DECIMALS,
         initialSupplyRaw: supplyRaw,
         tokenStandard,
+        ...(tokenStandard === 'TOKEN_2022' ? { authorities: authoritySettings } : {}),
       });
 
       const cloneTx = new Transaction().add(
@@ -994,6 +1003,12 @@ export default function App(): React.ReactElement {
       ).blockhash;
 
       assertMintToCheckedLayout(cloneResult.instructions, cloneResult.userTokenAta);
+      try {
+        // Fail before signing or sending if metadata + authority instructions exceed a packet.
+        cloneTx.serialize({ requireAllSignatures: false, verifySignatures: false });
+      } catch {
+        throw new Error('Transaksi pembuatan token terlalu besar; pendekkan nama, URI, atau metadata sosial lalu coba lagi.');
+      }
       logTxLayout('clone-tx', cloneTx.instructions);
 
       await signAndDispatch(
@@ -1592,6 +1607,35 @@ export default function App(): React.ReactElement {
             </div>
 
             <form onSubmit={handleLaunchPlatform} className="space-y-3.5">
+              {tokenStandard === 'TOKEN_2022' ? (
+                <fieldset className="space-y-2 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3" disabled={isBusy}>
+                  <legend className="px-1 text-xs font-semibold text-amber-200">Authority token baru (Token-2022)</legend>
+                  {([
+                    ['mint', 'Mint authority', 'ON: creator bisa mencetak token tambahan.'],
+                    ['freeze', 'Freeze authority', 'ON: creator bisa membekukan akun token.'],
+                    ['metadata', 'Metadata update authority', 'ON: creator bisa mengubah metadata dan pointer.'],
+                  ] as const).map(([key, label, description]) => (
+                    <div key={key} className="flex items-center justify-between gap-3">
+                      <div><div className="text-xs text-zinc-200">{label}</div><div className="text-[11px] text-zinc-400">{description}</div></div>
+                      <button type="button" role="switch" aria-label={label} aria-checked={authoritySettings[key]}
+                        onClick={() => { setAuthoritySettings((prev) => ({ ...prev, [key]: !prev[key] })); setAuthorityAcknowledged(false); }}
+                        className={`min-w-14 rounded border px-2 py-1 text-xs font-semibold ${authoritySettings[key] ? 'border-amber-500 text-amber-300' : 'border-emerald-500 text-emerald-300'}`}>
+                        {authoritySettings[key] ? 'ON' : 'OFF'}
+                      </button>
+                    </div>
+                  ))}
+                  <p className="text-[11px] text-amber-200">OFF berlaku permanen setelah token dibuat: mint tidak bisa ditambah, freeze tidak bisa diaktifkan kembali, dan metadata serta pointer OFF tidak bisa diubah. Metadata eksternal HTTPS masih dapat berubah.</p>
+                  {(!authoritySettings.mint || !authoritySettings.freeze || !authoritySettings.metadata) && (
+                    <label className="flex items-start gap-2 text-xs text-zinc-300">
+                      <input type="checkbox" checked={authorityAcknowledged} onChange={(e) => setAuthorityAcknowledged(e.target.checked)} />
+                      Saya memahami pilihan OFF permanen untuk token baru ini.
+                    </label>
+                  )}
+                  <p className="text-[11px] text-zinc-400">Kontrol ini tidak memengaruhi token lama atau upgrade authority program; bukan jaminan bebas rug pull.</p>
+                </fieldset>
+              ) : (
+                <p className="rounded-lg border border-zinc-700 p-3 text-xs text-amber-200">Kontrol authority ini hanya tersedia untuk Token-2022. Mode SPL Legacy tetap memakai pengaturan lama.</p>
+              )}
               <div className="grid grid-cols-3 gap-3">
                 <div className="col-span-2">
                   <label className="mb-1 block text-xs font-medium text-zinc-300">
