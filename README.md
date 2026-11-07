@@ -292,6 +292,12 @@ npm run build   # type-check ketat + build produksi ke dist/
 ```bash
 npm install
 npm test         # Uji seluruh layout biner Token-2022 & Virtual Liquidity AMM
+
+# Catatan: `npm test` membaca repo tempat ia dijalankan. Bagian 9 memeriksa
+# target/deploy/mini_amm-keypair.json JIKA ada, dan memastikan ia menunjuk
+# program ID yang sama dengan declare_id!. Jadi:
+#   - setelah `anchor build`  -> keypair harus cocok (kalau tidak: `anchor keys sync` + rebuild)
+#   - sebelum pernah build    -> keypair tidak ada, tes tetap lolos
 npm run typecheck# Type-check ketat TypeScript (strict, noUnusedLocals)
 npm run build    # Type-check + build produksi Vite (dist/)
 npm run dev      # Dashboard interaktif di http://localhost:5173 (0.0.0.0)
