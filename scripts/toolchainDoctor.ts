@@ -34,17 +34,25 @@ export interface Version {
 
 /** Ambil versi pertama yang cocok dari sebuah teks, mis. `rustc 1.84.1` → 1.84.1. */
 export function parseVersion(text: string, label: string): Version | null {
-  const re = new RegExp(`${label}\\s+v?(\\d+)\\.(\\d+)\\.(\\d+)`, 'i');
-  const m = text.match(re);
-  if (!m) {
-    return null;
+  // `cargo-build-sbf 4.5.0` tidak menyebut "rustc" sama sekali; versi rustc
+  // dilaporkan sebagai `Default Rust: 1.95.0`. Terima kedua bentuk, dan izinkan
+  // pemisah `:` selain spasi (mis. `rustc SBF : 1.95.0`).
+  const labels =
+    label.toLowerCase() === 'rustc' ? ['rustc', 'Default Rust', 'Rust'] : [label];
+  for (const name of labels) {
+    const re = new RegExp(`${name}\\s*:?\\s*v?(\\d+)\\.(\\d+)\\.(\\d+)`, 'i');
+    const m = text.match(re);
+    if (m) {
+      return { major: Number(m[1]), minor: Number(m[2]), patch: Number(m[3]) };
+    }
   }
-  return { major: Number(m[1]), minor: Number(m[2]), patch: Number(m[3]) };
+  return null;
 }
 
 /** `platform-tools v1.58` → 58 (dibandingkan sebagai integer). */
 export function parsePlatformTools(text: string): number | null {
-  const m = text.match(/platform-tools\s+v?(\d+)\.(\d+)/i);
+  // Bentuk nyata: `Default platform-tools: v1.57` (ada titik dua).
+  const m = text.match(/platform-tools\s*:?\s*v?(\d+)\.(\d+)/i);
   if (!m) {
     return null;
   }
@@ -461,8 +469,12 @@ function main(): void {
   console.log(
     `solana_version  : ${report.anchorSolanaVersion ?? 'tidak dipatok di Anchor.toml'} (minimal 4.0.0)`
   );
+  // Dua hal berbeda: `resolver = "2"` (wajib, agar Anchor bisa mem-parse Cargo.toml)
+  // dan `.cargo/config.toml` MSRV-aware (opsional di rustc >= 1.85). Jangan
+  // laporkan "belum" hanya karena config fallback tidak ada.
+  const resolverLabel = report.resolver ? `resolver=${report.resolver}` : 'resolver tidak dipatok';
   console.log(
-    `Resolver MSRV   : ${report.msrvAwareResolver ? 'aktif' : `belum (resolver=${report.resolver ?? '-'})`}`
+    `Resolver MSRV   : ${report.msrvAwareResolver ? 'aktif (.cargo/config.toml)' : `tidak perlu (${resolverLabel}, rustc SBF sudah >= 1.85)`}`
   );
   console.log(`dist (bundle)   : ${report.distStale ? '\u2716 BASI — jalankan npm run build' : 'ok / belum ada'}`);
   console.log(`declare_id!     : ${report.declareId ?? 'tidak terbaca'}`);
