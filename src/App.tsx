@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { formatExactTokenAmount, readSwapTokenBalance } from './tradeUtils';
+import { assertMainnetWallet, assertRpcNetwork, assertRpcReady, ExecutionMode, resolveProgramId } from './network';
 import {
   AccountInfo,
   Commitment,
@@ -86,6 +87,13 @@ const DEVNET_RPC_ENDPOINT =
   (import.meta.env.VITE_RPC_ENDPOINT as string | undefined)?.trim() ||
   'https://api.devnet.solana.com';
 
+const MAINNET_RPC_ENDPOINT =
+  (import.meta.env.VITE_MAINNET_RPC_ENDPOINT as string | undefined)?.trim() ||
+  'https://api.mainnet-beta.solana.com';
+
+const MAINNET_AMM_PROGRAM_ID = resolveProgramId('MAINNET', import.meta.env.VITE_MAINNET_AMM_PROGRAM_ID as string | undefined, DEFAULT_AMM_PROGRAM_ID);
+const DEVNET_AMM_PROGRAM_ID = resolveProgramId('DEVNET', import.meta.env.VITE_DEVNET_AMM_PROGRAM_ID as string | undefined, DEFAULT_AMM_PROGRAM_ID);
+
 const DEVNET_RPC_HOST = ((): string => {
   try {
     return new URL(DEVNET_RPC_ENDPOINT).host;
@@ -115,7 +123,8 @@ const withComputeBudget = (tx: Transaction, units: number): Transaction => {
 };
 
 /** Terjemahkan error RPC/preflight menjadi pesan yang bisa ditindaklanjuti. */
-const describeRpcError = (err: unknown, rpcEndpoint: string): string => {
+const describeRpcError = (err: unknown, rpcEndpoint: string, programId: PublicKey): string => {
+  try { rpcEndpoint = new URL(rpcEndpoint).host; } catch { rpcEndpoint = 'RPC'; }
   const logs =
     typeof err === 'object' && err !== null && 'logs' in err
       ? ((err as { logs?: string[] | null }).logs ?? null)
@@ -128,7 +137,7 @@ const describeRpcError = (err: unknown, rpcEndpoint: string): string => {
       haystack
     )
   ) {
-    return `Program AMM ${DEFAULT_AMM_PROGRAM_ID.toBase58()} belum ter-deploy di ${rpcEndpoint}. Jalankan "anchor build && anchor deploy --provider.cluster devnet" terlebih dahulu. (build ${SDK_BUILD_TAG} — kalau ID di atas bukan program yang baru Anda deploy, browser masih memuat bundle lama: tekan Ctrl+Shift+R atau jalankan "npm run build" ulang.)`;
+    return `Program AMM ${programId.toBase58()} tidak tersedia di ${rpcEndpoint}. Periksa jaringan dan deployment sebelum transaksi.`;
   }
   // Anchor ErrorCode 4100 / custom error 0x1004: binary yang ter-deploy
   // dikompilasi dengan declare_id! berbeda dari alamat tempat ia di-deploy.
@@ -138,11 +147,9 @@ const describeRpcError = (err: unknown, rpcEndpoint: string): string => {
     const tail = logs && logs.length > 0 ? `\nLog: ${logs.slice(-2).join(' | ')}` : '';
     return [
       `Instruksi ${failedIx ?? '?'} gagal: DeclaredProgramIdMismatch (Anchor 4100 / 0x1004).`,
-      `Program di ${DEFAULT_AMM_PROGRAM_ID.toBase58()} dikompilasi untuk program ID yang berbeda,`,
+      `Program di ${programId.toBase58()} dikompilasi untuk program ID yang berbeda,`,
       'jadi Anchor menolak semua instruksi di entrypoint.',
-      'Perbaikan: samakan declare_id! dengan alamat deploy (yang sudah dipakai di sini), lalu',
-      '  anchor build && anchor upgrade --program-id ' +
-        `${DEFAULT_AMM_PROGRAM_ID.toBase58()} target/deploy/mini_amm.so`,
+      'Periksa kesesuaian declare_id!, program ID dan binary yang di-deploy sebelum melanjutkan.',
     ].join(' ') + tail;
   }
   if (/insufficient (funds|lamports)|InsufficientFundsForRent|0x1/i.test(haystack)) {
@@ -152,7 +159,7 @@ const describeRpcError = (err: unknown, rpcEndpoint: string): string => {
     return 'Blockhash transaksi kedaluwarsa. Coba kirim ulang (pipeline akan mengambil blockhash baru).';
   }
   if (/429|Too Many Requests|rate.?limit|-32429/i.test(haystack)) {
-    return `RPC ${rpcEndpoint} menolak karena rate-limit. Set VITE_RPC_ENDPOINT ke RPC devnet lain (Helius/QuickNode) di file .env.`;
+    return `RPC ${rpcEndpoint} menolak karena rate-limit. Gunakan RPC lain untuk jaringan yang sama.`;
   }
   if (/User rejected|rejected the request/i.test(haystack)) {
     return 'Transaksi ditolak di wallet.';
@@ -272,7 +279,7 @@ const shortenAddress = (addr: string, chars = 6): string =>
 
 export default function App(): React.ReactElement {
   // Cluster & Wallet State
-  const [executionMode, setExecutionMode] = useState<'SANDBOX' | 'DEVNET'>(
+  const [executionMode, setExecutionMode] = useState<ExecutionMode>(
     'SANDBOX'
   );
   const [walletPubkey, setWalletPubkey] = useState<PublicKey | null>(null);
@@ -341,7 +348,7 @@ export default function App(): React.ReactElement {
   const [poolInfo, setPoolInfo] = useState<DeserializedPoolInfo | null>(null);
   const [sandboxTokenBalanceRaw, setSandboxTokenBalanceRaw] = useState<bigint>(0n);
   const [sandboxOwner, setSandboxOwner] = useState<string | null>(null);
-  const [poolMode, setPoolMode] = useState<'SANDBOX' | 'DEVNET' | null>(null);
+  const [poolMode, setPoolMode] = useState<ExecutionMode | null>(null);
   const [devnetBalance, setDevnetBalance] = useState<{ key: string; amount: bigint } | null>(null);
   const [balanceError, setBalanceError] = useState<string | null>(null);
   const [balanceBusy, setBalanceBusy] = useState(false);
@@ -353,6 +360,10 @@ export default function App(): React.ReactElement {
   // Status devnet: saldo SOL wallet & proses airdrop
   const [solBalance, setSolBalance] = useState<number | null>(null);
   const [airdropBusy, setAirdropBusy] = useState<boolean>(false);
+  const [walletBusy, setWalletBusy] = useState(false);
+  const [mainnetAcknowledged, setMainnetAcknowledged] = useState(false);
+  const [networkRevision, setNetworkRevision] = useState(0);
+  const [networkStatus, setNetworkStatus] = useState<{ key: string; state: 'checking' | 'ready' | 'error'; message: string } | null>(null);
 
   // Interactive Swap Terminal State
   const [tradeSide, setTradeSide] = useState<'BUY' | 'SELL'>('BUY');
@@ -363,6 +374,42 @@ export default function App(): React.ReactElement {
     () => new Connection(DEVNET_RPC_ENDPOINT, 'confirmed'),
     []
   );
+
+  const mainnetConnection = useMemo(
+    () => new Connection(MAINNET_RPC_ENDPOINT, 'confirmed'), []
+  );
+  const rpcConnection = executionMode === 'MAINNET' ? mainnetConnection : devnetConnection;
+  const selectedProgramId = executionMode === 'MAINNET' ? MAINNET_AMM_PROGRAM_ID
+    : executionMode === 'DEVNET' ? DEVNET_AMM_PROGRAM_ID : DEFAULT_AMM_PROGRAM_ID;
+  const networkKey = `${executionMode}:${rpcConnection.rpcEndpoint}:${selectedProgramId?.toBase58() ?? ''}`;
+  const rpcReady = executionMode === 'SANDBOX' || (networkStatus?.key === networkKey && networkStatus.state === 'ready');
+  const operationAllowed = rpcReady && (executionMode !== 'MAINNET' ||
+    (mainnetAcknowledged && walletType === 'INJECTED' && walletPubkey !== null));
+  const rpcHost = executionMode === 'MAINNET'
+    ? (() => { try { return new URL(MAINNET_RPC_ENDPOINT).host; } catch { return 'RPC'; } })()
+    : DEVNET_RPC_HOST;
+
+  useEffect(() => {
+    if (executionMode === 'SANDBOX') return;
+    let cancelled = false;
+    setNetworkStatus({ key: networkKey, state: 'checking', message: 'Memeriksa jaringan dan program…' });
+    void assertRpcReady(rpcConnection, executionMode, selectedProgramId)
+      .then(() => {
+        if (!cancelled) setNetworkStatus({ key: networkKey, state: 'ready', message: 'Jaringan dan program terdeteksi.' });
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) setNetworkStatus({ key: networkKey, state: 'error', message: err instanceof Error ? err.message : 'Pemeriksaan RPC gagal.' });
+      });
+    return () => { cancelled = true; };
+  }, [executionMode, networkKey, networkRevision, rpcConnection, selectedProgramId]);
+
+  const assertCurrentNetwork = async (): Promise<void> => {
+    if (executionMode === 'SANDBOX') return;
+    if (executionMode === 'MAINNET' && (!mainnetAcknowledged || walletType !== 'INJECTED' || !walletPubkey)) {
+      throw new Error('Mainnet memerlukan wallet Phantom dan persetujuan risiko mainnet.');
+    }
+    await assertRpcReady(rpcConnection, executionMode, selectedProgramId);
+  };
 
   const activeOwner = walletPubkey ?? ephemeralKeypair.publicKey;
   const balanceKey = poolInfo
@@ -378,7 +425,7 @@ export default function App(): React.ReactElement {
   // Refresh the on-chain ATA after launch, swap, claim, or wallet/mode changes.
   useEffect(() => {
     const request = ++balanceRequest.current;
-    if (!poolInfo || executionMode !== 'DEVNET' || poolMode !== 'DEVNET') {
+    if (!poolInfo || executionMode === 'SANDBOX' || poolMode !== executionMode || !rpcReady) {
       setBalanceBusy(false);
       setBalanceError(null);
       return;
@@ -387,7 +434,7 @@ export default function App(): React.ReactElement {
     setDevnetBalance(null);
     setBalanceError(null);
     setBalanceBusy(true);
-    void readSwapTokenBalance(devnetConnection, activeOwner, poolInfo.tokenY, poolInfo.tokenProgramY)
+    void readSwapTokenBalance(rpcConnection, activeOwner, poolInfo.tokenY, poolInfo.tokenProgramY)
       .then((amount) => {
         if (!cancelled && request === balanceRequest.current) setDevnetBalance({ key: balanceKey, amount });
       })
@@ -401,10 +448,10 @@ export default function App(): React.ReactElement {
       });
     return () => { cancelled = true; };
   // Key includes the owner, mint and token program; reserves updates do not require a read.
-  }, [balanceKey, balanceRevision, devnetConnection, poolMode]);
+  }, [balanceKey, balanceRevision, rpcConnection, poolMode, rpcReady]);
 
   const handleSellAll = async (): Promise<void> => {
-    if (!poolInfo || poolMode !== executionMode) return;
+    if (!poolInfo || poolMode !== executionMode || !rpcReady) return;
     setTradeSide('SELL');
     setTradeAmountInput('');
     setErrorMessage(null);
@@ -418,7 +465,7 @@ export default function App(): React.ReactElement {
     setBalanceError(null);
     setDevnetBalance(null);
     try {
-      const amount = await readSwapTokenBalance(devnetConnection, activeOwner, poolInfo.tokenY, poolInfo.tokenProgramY);
+      const amount = await readSwapTokenBalance(rpcConnection, activeOwner, poolInfo.tokenY, poolInfo.tokenProgramY);
       if (request !== balanceRequest.current || key !== currentBalanceKey.current) return;
       setDevnetBalance({ key, amount });
       setTradeAmountInput(formatExactTokenAmount(amount));
@@ -457,12 +504,21 @@ export default function App(): React.ReactElement {
     conn: Connection,
     pubkey: PublicKey | null | undefined
   ): Promise<void> => {
-    if (!pubkey || executionMode !== 'DEVNET') {
+    if (!pubkey || executionMode === 'SANDBOX') {
       setSolBalance(null);
       return;
     }
     setSolBalance(await readSolBalance(conn, pubkey));
   };
+
+  useEffect(() => {
+    let cancelled = false;
+    setSolBalance(null);
+    if (executionMode !== 'SANDBOX' && rpcReady && walletPubkey) {
+      void readSolBalance(rpcConnection, walletPubkey).then((balance) => { if (!cancelled) setSolBalance(balance); });
+    }
+    return () => { cancelled = true; };
+  }, [executionMode, rpcConnection, rpcReady, walletPubkey]);
 
   // Cek kesiapan endpoint Pinata di dev server (tidak tersedia di build produksi).
   useEffect(() => {
@@ -547,6 +603,9 @@ export default function App(): React.ReactElement {
 
   const handleConnectWallet = async (preferInjected: boolean): Promise<void> => {
     setErrorMessage(null);
+    if (executionMode === 'MAINNET' && !preferInjected) { setErrorMessage('Mainnet memerlukan wallet Phantom.'); return; }
+    if (preferInjected && !window.solana) { setErrorMessage('Wallet Phantom tidak tersedia.'); return; }
+    setWalletBusy(true);
     if (preferInjected && window.solana) {
       try {
         const res = await window.solana.connect();
@@ -555,12 +614,13 @@ export default function App(): React.ReactElement {
         setStatusBanner(
           `Wallet Terhubung (${shortenAddress(res.publicKey.toBase58())})`
         );
-        await refreshSolBalance(devnetConnection, res.publicKey);
+        setWalletBusy(false);
         return;
       } catch (err) {
         setErrorMessage(
           err instanceof Error ? err.message : 'Gagal menghubungkan wallet'
         );
+        setWalletBusy(false);
         return;
       }
     }
@@ -570,7 +630,7 @@ export default function App(): React.ReactElement {
     setStatusBanner(
       `Mock Keypair Terhubung (${shortenAddress(ephemeralKeypair.publicKey.toBase58())})`
     );
-    await refreshSolBalance(devnetConnection, ephemeralKeypair.publicKey);
+    setWalletBusy(false);
   };
 
   const handleDisconnectWallet = async (): Promise<void> => {
@@ -580,6 +640,7 @@ export default function App(): React.ReactElement {
     setWalletPubkey(null);
     setWalletType(null);
     setSolBalance(null);
+    setMainnetAcknowledged(false);
     setStatusBanner('Wallet terputus');
   };
 
@@ -595,6 +656,7 @@ export default function App(): React.ReactElement {
       if (executionMode !== 'DEVNET') {
         throw new Error('Airdrop hanya tersedia pada mode Devnet RPC');
       }
+      await assertRpcNetwork(devnetConnection, 'DEVNET');
       const signature = await devnetConnection.requestAirdrop(
         target,
         LAMPORTS_PER_SOL
@@ -651,13 +713,17 @@ export default function App(): React.ReactElement {
     // deteksi kedaluwarsa salah dan kegagalan on-chain tidak pernah terdeteksi).
     let blockhash = tx.recentBlockhash;
     let lastValidBlockHeight: number | undefined;
-    if (executionMode === 'DEVNET') {
+    if (executionMode !== 'SANDBOX') {
+      await assertCurrentNetwork();
       const latest = await conn.getLatestBlockhash('confirmed');
       blockhash = latest.blockhash;
       lastValidBlockHeight = latest.lastValidBlockHeight;
       tx.recentBlockhash = latest.blockhash;
     }
 
+    if (executionMode === 'MAINNET') {
+      assertMainnetWallet(mainnetAcknowledged, walletType, walletPubkey, window.solana?.publicKey, tx.feePayer);
+    }
     if (extraSigners.length > 0) {
       tx.partialSign(...extraSigners);
     }
@@ -678,13 +744,16 @@ export default function App(): React.ReactElement {
       return { signature: sig, byteLength: rawTx.byteLength };
     }
 
+    let submittedSignature: string | null = null;
     try {
+      await assertCurrentNetwork();
       const signature = await conn.sendRawTransaction(rawTx, {
         skipPreflight: false,
         preflightCommitment: 'confirmed',
         maxRetries: 3,
       });
 
+      submittedSignature = signature;
       const confirmation = await conn.confirmTransaction(
         {
           signature,
@@ -705,7 +774,11 @@ export default function App(): React.ReactElement {
       await refreshSolBalance(conn, tx.feePayer);
       return { signature, byteLength: rawTx.byteLength };
     } catch (err) {
-      throw new Error(describeRpcError(err, conn.rpcEndpoint));
+      const detail = describeRpcError(err, conn.rpcEndpoint, selectedProgramId ?? DEFAULT_AMM_PROGRAM_ID);
+      if (submittedSignature) {
+        throw new Error(`Transaksi ${submittedSignature} telah dikirim. Periksa status di Explorer ${executionMode} sebelum mengulang: ${detail}`);
+      }
+      throw new Error(detail);
     }
   };
 
@@ -888,6 +961,10 @@ export default function App(): React.ReactElement {
       return;
     }
 
+    if (!operationAllowed) {
+      setErrorMessage('Periksa jaringan, program ID, wallet, dan persetujuan mainnet sebelum launch.');
+      return;
+    }
     const activePayer = walletPubkey ?? ephemeralKeypair.publicKey;
     if (!walletPubkey) {
       setWalletPubkey(ephemeralKeypair.publicKey);
@@ -927,20 +1004,23 @@ export default function App(): React.ReactElement {
     ]);
 
     const activeConnection =
-      executionMode === 'SANDBOX' ? sandboxConnection : devnetConnection;
-    const sdk = new CustomDefiSDK(activeConnection, DEFAULT_AMM_PROGRAM_ID);
+      executionMode === 'SANDBOX' ? sandboxConnection : rpcConnection;
+    const sdk = new CustomDefiSDK(activeConnection, selectedProgramId ?? DEFAULT_AMM_PROGRAM_ID);
 
+    let attemptedMint: string | null = null;
+    setStage('MINTING_TOKEN');
     try {
-      // Guard devnet: tanpa SOL, transaksi pertama sudah gagal di preflight.
-      if (executionMode === 'DEVNET') {
-        const balance = await readSolBalance(devnetConnection, activePayer);
+      // Check before creating a mint: do not leave an orphan token when AMM is absent.
+      await assertCurrentNetwork();
+      if (executionMode !== 'SANDBOX') {
+        const balance = await readSolBalance(rpcConnection, activePayer);
         setSolBalance(balance);
         if (balance === null) {
           throw new Error(
-            `Tidak bisa membaca saldo dari ${DEVNET_RPC_HOST}. Periksa koneksi / ganti VITE_RPC_ENDPOINT.`
+            `Tidak bisa membaca saldo dari ${rpcHost}. Periksa koneksi RPC.`
           );
         }
-        if (balance < MIN_DEVNET_SOL) {
+        if (executionMode === 'DEVNET' && balance < MIN_DEVNET_SOL) {
           throw new Error(
             `Saldo devnet ${balance.toFixed(4)} SOL kurang dari ${MIN_DEVNET_SOL} SOL. Klik "Airdrop 1 SOL" (mock keypair) atau hubungkan Phantom yang punya SOL devnet.`
           );
@@ -1011,6 +1091,7 @@ export default function App(): React.ReactElement {
       }
       logTxLayout('clone-tx', cloneTx.instructions);
 
+      attemptedMint = cloneResult.mint.toBase58();
       await signAndDispatch(
         cloneTx,
         [cloneResult.mintKeypair],
@@ -1019,7 +1100,7 @@ export default function App(): React.ReactElement {
 
       updateStep(1, {
         status: 'done',
-        detail: `Mint ${shortenAddress(cloneResult.mint.toBase58())} (${cloneResult.allocatedMintBytes}B Mint, ${cloneResult.instructions.length} raw ixs)`,
+        detail: `Mint ${cloneResult.mint.toBase58()} (${cloneResult.allocatedMintBytes}B Mint, ${cloneResult.instructions.length} raw ixs)`,
       });
 
       // ----------------------------------------------------------------------
@@ -1192,7 +1273,10 @@ export default function App(): React.ReactElement {
         `Success! $${ticker.trim().toUpperCase()} (${cloneResult.tokenStandard}) aktif di Virtual Liquidity AMM`
       );
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Transaksi gagal';
+      const reason = err instanceof Error ? err.message : 'Transaksi gagal';
+      const msg = attemptedMint && executionMode !== 'SANDBOX'
+        ? `${reason} Mint yang dicoba: ${attemptedMint}. Periksa Explorer dan status transaksi sebelum mengulang launch.`
+        : reason;
       setStage('ERROR');
       setErrorMessage(msg);
       setStatusBanner(`Pipeline terhenti: ${msg}`);
@@ -1243,13 +1327,13 @@ export default function App(): React.ReactElement {
   }, [poolInfo, tradeAmountInput, tradeSide]);
 
   const handleExecuteSwap = async (): Promise<void> => {
-    if (!poolInfo || !swapQuote || poolMode !== executionMode) return;
+    if (!poolInfo || !swapQuote || poolMode !== executionMode || !operationAllowed) return;
     setErrorMessage(null);
 
     const activeUser = walletPubkey ?? ephemeralKeypair.publicKey;
     const activeConnection =
-      executionMode === 'SANDBOX' ? sandboxConnection : devnetConnection;
-    const sdk = new CustomDefiSDK(activeConnection, DEFAULT_AMM_PROGRAM_ID);
+      executionMode === 'SANDBOX' ? sandboxConnection : rpcConnection;
+    const sdk = new CustomDefiSDK(activeConnection, selectedProgramId ?? DEFAULT_AMM_PROGRAM_ID);
 
     setStage('SWAPPING');
     try {
@@ -1257,8 +1341,8 @@ export default function App(): React.ReactElement {
         throw new Error('Pool sandbox hanya mendukung wallet yang membuat pool');
       }
       if (tradeSide === 'SELL') {
-        const balance = executionMode === 'DEVNET'
-          ? await readSwapTokenBalance(devnetConnection, activeUser, poolInfo.tokenY, poolInfo.tokenProgramY)
+        const balance = executionMode !== 'SANDBOX'
+          ? await readSwapTokenBalance(rpcConnection, activeUser, poolInfo.tokenY, poolInfo.tokenProgramY)
           : userTokenBalanceRaw;
         if (balance === null || swapQuote.amountInRaw > balance) {
           throw new Error(`Saldo ${ticker.toUpperCase()} tidak mencukupi atau belum tersedia`);
@@ -1273,7 +1357,7 @@ export default function App(): React.ReactElement {
       );
 
       if (executionMode === 'DEVNET' && isBuy) {
-        const balance = await readSolBalance(devnetConnection, activeUser);
+        const balance = await readSolBalance(rpcConnection, activeUser);
         setSolBalance(balance);
         if (balance !== null && balance < MIN_DEVNET_SOL) {
           throw new Error(
@@ -1369,11 +1453,11 @@ export default function App(): React.ReactElement {
    * fee vault dikosongkan pada ledger lokal agar alur UI-nya tetap teruji.
    */
   const handleClaimCreatorFee = async (): Promise<void> => {
-    if (!poolInfo || poolMode !== executionMode) return;
+    if (!poolInfo || poolMode !== executionMode || !operationAllowed) return;
     const activeUser = walletPubkey ?? ephemeralKeypair.publicKey;
     const activeConnection =
-      executionMode === 'SANDBOX' ? sandboxConnection : devnetConnection;
-    const sdk = new CustomDefiSDK(activeConnection, DEFAULT_AMM_PROGRAM_ID);
+      executionMode === 'SANDBOX' ? sandboxConnection : rpcConnection;
+    const sdk = new CustomDefiSDK(activeConnection, selectedProgramId ?? DEFAULT_AMM_PROGRAM_ID);
 
     setErrorMessage(null);
 
@@ -1467,44 +1551,30 @@ export default function App(): React.ReactElement {
                 <code className="text-zinc-300" title="Stempel layout SDK terbaru">
                   {SDK_BUILD_TAG}
                 </code>
-                {executionMode === 'DEVNET' && <> &bull; RPC {DEVNET_RPC_HOST}</>}
+                {executionMode !== 'SANDBOX' && <> &bull; {executionMode} · RPC {rpcHost}</>}
               </p>
             </div>
           </div>
 
           <div className="flex flex-wrap items-center gap-2.5">
-            <div className="inline-flex rounded-lg border border-zinc-800 bg-zinc-900 p-0.5 text-xs">
-              <button
-                type="button"
-                onClick={() => {
-                  setExecutionMode('SANDBOX');
-                  setSolBalance(null);
-                }}
-                className={`rounded-md px-2.5 py-1 font-medium transition ${
-                  executionMode === 'SANDBOX'
-                    ? 'bg-zinc-800 text-emerald-400 shadow-sm'
-                    : 'text-zinc-400 hover:text-zinc-200'
-                }`}
-              >
-                Binary Sandbox
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setExecutionMode('DEVNET');
-                  void refreshSolBalance(
-                    devnetConnection,
-                    walletPubkey ?? ephemeralKeypair.publicKey
-                  );
-                }}
-                className={`rounded-md px-2.5 py-1 font-medium transition ${
-                  executionMode === 'DEVNET'
-                    ? 'bg-zinc-800 text-cyan-400 shadow-sm'
-                    : 'text-zinc-400 hover:text-zinc-200'
-                }`}
-              >
-                Devnet RPC
-              </button>
+            <div role="group" aria-label="Pilih jaringan" className="inline-flex rounded-lg border border-zinc-800 bg-zinc-900 p-0.5 text-xs">
+              {(['SANDBOX', 'DEVNET', 'MAINNET'] as const).map((mode) => (
+                <button key={mode} type="button" aria-pressed={executionMode === mode}
+                  disabled={isBusy || claimBusy || airdropBusy || walletBusy}
+                  onClick={() => {
+                    setExecutionMode(mode);
+                    setSolBalance(null);
+                    setMainnetAcknowledged(false);
+                    setErrorMessage(null);
+                    if (mode === 'MAINNET' && walletType === 'EPHEMERAL') {
+                      setWalletPubkey(null);
+                      setWalletType(null);
+                    }
+                  }}
+                  className={`rounded-md px-2.5 py-1 font-semibold transition disabled:opacity-50 ${executionMode === mode ? (mode === 'MAINNET' ? 'bg-rose-600 text-white' : 'bg-zinc-800 text-cyan-300') : 'text-zinc-400 hover:text-zinc-200'}`}>
+                  {mode === 'SANDBOX' ? 'Binary Sandbox' : mode === 'MAINNET' ? 'MAINNET' : 'Devnet'}
+                </button>
+              ))}
             </div>
 
             {walletPubkey ? (
@@ -1516,6 +1586,7 @@ export default function App(): React.ReactElement {
                 <button
                   type="button"
                   onClick={handleDisconnectWallet}
+                  disabled={isBusy || claimBusy || airdropBusy || walletBusy}
                   className="ml-1 text-zinc-400 hover:text-zinc-100"
                 >
                   &times;
@@ -1523,16 +1594,18 @@ export default function App(): React.ReactElement {
               </div>
             ) : (
               <div className="flex items-center gap-2">
-                <button
+                {executionMode !== 'MAINNET' && <button
                   type="button"
+                  disabled={isBusy || claimBusy || airdropBusy || walletBusy}
                   onClick={() => handleConnectWallet(false)}
                   className="rounded-lg border border-emerald-500/50 bg-emerald-500/15 px-3.5 py-1.5 text-xs font-medium text-emerald-300 transition hover:bg-emerald-500/25"
                 >
                   Connect Mock Keypair
-                </button>
+                </button>}
                 {typeof window !== 'undefined' && window.solana && (
                   <button
                     type="button"
+                    disabled={isBusy || claimBusy || airdropBusy || walletBusy}
                     onClick={() => handleConnectWallet(true)}
                     className="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-xs font-medium text-zinc-200 transition hover:border-zinc-600"
                   >
@@ -1542,15 +1615,15 @@ export default function App(): React.ReactElement {
               </div>
             )}
 
-            {executionMode === 'DEVNET' && (
+            {executionMode !== 'SANDBOX' && (
               <div className="flex items-center gap-2">
                 <span
                   className="rounded-lg border border-zinc-800 bg-zinc-900 px-2.5 py-1.5 font-mono text-xs text-zinc-300"
-                  title={`Saldo ${walletPubkey ? shortenAddress(walletPubkey.toBase58()) : 'wallet'} di ${DEVNET_RPC_HOST}`}
+                  title={`Saldo ${walletPubkey ? shortenAddress(walletPubkey.toBase58()) : 'wallet'} di ${rpcHost}`}
                 >
                   {solBalance === null ? '— SOL' : `${solBalance.toFixed(4)} SOL`}
                 </span>
-                {walletType !== 'INJECTED' && (
+                {executionMode === 'DEVNET' && walletType !== 'INJECTED' && (
                   <button
                     type="button"
                     onClick={handleAirdrop}
@@ -1565,6 +1638,20 @@ export default function App(): React.ReactElement {
           </div>
         </div>
       </header>
+
+      {executionMode !== 'SANDBOX' && (
+        <div role="status" className={`mx-auto mt-3 max-w-6xl rounded-lg border px-4 py-3 text-xs ${executionMode === 'MAINNET' ? 'border-rose-500/60 bg-rose-950/50 text-rose-100' : 'border-cyan-500/40 bg-cyan-950/30 text-cyan-100'}`}>
+          <div className="font-bold">{executionMode === 'MAINNET' ? 'MAINNET — SOL NYATA, TRANSAKSI TIDAK DAPAT DIBATALKAN' : 'DEVNET — SOL UJI'}</div>
+          <div>RPC: {rpcHost} · Program ID: <span className="break-all font-mono">{selectedProgramId?.toBase58() ?? 'belum dikonfigurasi'}</span></div>
+          <div>{networkStatus?.key === networkKey ? networkStatus.message : 'Memeriksa jaringan…'}{' '}
+            <button type="button" onClick={() => setNetworkRevision((n) => n + 1)} className="underline" disabled={isBusy || claimBusy}>Periksa ulang</button>
+          </div>
+          {executionMode === 'MAINNET' && <>
+            <p className="mt-1">Gunakan Phantom dengan jaringan mainnet. Pengecekan hanya memastikan RPC dan akun program, bukan audit, kecocokan binary, atau jaminan keamanan. Pool tidak memiliki remove liquidity.</p>
+            <label className="mt-2 flex items-center gap-2"><input type="checkbox" checked={mainnetAcknowledged} disabled={isBusy || claimBusy} onChange={(e) => setMainnetAcknowledged(e.target.checked)} /> Saya memahami bahwa mainnet menggunakan dana nyata.</label>
+          </>}
+        </div>
+      )}
 
       {/* Main Content */}
       <main className="mx-auto grid max-w-6xl gap-6 px-5 py-7 lg:grid-cols-12">
@@ -1838,7 +1925,7 @@ export default function App(): React.ReactElement {
 
               <button
                 type="submit"
-                disabled={isBusy}
+                disabled={isBusy || claimBusy || balanceBusy || walletBusy || !operationAllowed}
                 className="w-full rounded-lg bg-emerald-500 px-4 py-2.5 text-sm font-semibold text-zinc-950 shadow-lg shadow-emerald-500/10 transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 {stage === 'MINTING_TOKEN'
@@ -2053,7 +2140,7 @@ export default function App(): React.ReactElement {
                       type="button"
                       onClick={() => void handleClaimCreatorFee()}
                       disabled={
-                        claimBusy || isBusy || poolMode !== executionMode ||
+                        claimBusy || isBusy || !operationAllowed || poolMode !== executionMode ||
                         !poolInfo ||
                         (poolInfo.creatorFeeX === 0n && poolInfo.creatorFeeY === 0n)
                       }
@@ -2139,7 +2226,7 @@ export default function App(): React.ReactElement {
                     </label>
                     <div className="mb-1 flex justify-end">
                       <button type="button" onClick={() => void handleSellAll()}
-                        disabled={isBusy || claimBusy || balanceBusy || poolMode !== executionMode}
+                        disabled={isBusy || claimBusy || balanceBusy || !rpcReady || poolMode !== executionMode}
                         className="rounded border border-rose-500/50 px-2 py-1 text-xs font-semibold text-rose-300 hover:bg-rose-500/15 disabled:opacity-50">
                         {balanceBusy ? 'Membaca saldo…' : 'SELL ALL'}
                       </button>
@@ -2173,7 +2260,7 @@ export default function App(): React.ReactElement {
                 {tradeSide === 'SELL' && !swapQuote && <p className="mt-2 text-xs text-amber-300">Estimasi tidak tersedia: periksa jumlah, output minimum, dan cadangan SOL riil pool.</p>}
                 <button
                   type="button"
-                  disabled={!swapQuote || isBusy || claimBusy || balanceBusy || poolMode !== executionMode}
+                  disabled={!swapQuote || isBusy || claimBusy || balanceBusy || !operationAllowed || poolMode !== executionMode}
                   onClick={handleExecuteSwap}
                   className={`mt-3 w-full rounded-lg px-4 py-2 text-xs font-semibold transition disabled:opacity-50 ${
                     tradeSide === 'BUY'

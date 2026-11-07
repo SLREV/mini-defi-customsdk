@@ -1,6 +1,6 @@
 # Solana Token-2022 Launchpad & Virtual Liquidity AMM (`TokenInterface` + `TransferChecked`)
 
-Production-ready boilerplate untuk **DeFi Token-2022 Launchpad & Virtual Liquidity Constant Product AMM** menggunakan **Anchor 0.31+ (Rust)** + **Pure `@solana/web3.js` & `@solana/buffer-layout` (TypeScript)** + **Vite + React + TailwindCSS** — **tanpa SDK pihak ketiga**.
+Boilerplate eksperimental untuk **DeFi Token-2022 Launchpad & Virtual Liquidity Constant Product AMM** menggunakan **Anchor 0.31+ (Rust)** + **Pure `@solana/web3.js` & `@solana/buffer-layout` (TypeScript)** + **Vite + React + TailwindCSS** — **tanpa SDK pihak ketiga**.
 
 ## Keunggulan Arsitektur Token-2022 & Virtual Liquidity
 
@@ -77,6 +77,24 @@ Anchor 0.31 mendukung **custom discriminator** 1 byte (`#[instruction(discrimina
 └── vite.config.ts
 ```
 
+## Pilihan jaringan: Sandbox, Devnet, Mainnet
+
+Dashboard memiliki tombol **Binary Sandbox**, **Devnet**, dan **MAINNET**. Default adalah Sandbox. Mainnet menggunakan SOL sungguhan, memerlukan wallet Phantom/injected (bukan mock keypair), persetujuan risiko, serta program AMM yang sudah di-deploy dan diverifikasi terpisah di mainnet. Program, token, pool dan saldo devnet tidak otomatis pindah ke mainnet. Tidak ada airdrop mainnet dan proyek ini belum diaudit; kode ini tidak membuat atau menambahkan instruksi remove liquidity.
+
+Pada `.env`, atur:
+
+```dotenv
+VITE_RPC_ENDPOINT=https://api.devnet.solana.com
+VITE_MAINNET_RPC_ENDPOINT=https://api.mainnet-beta.solana.com
+# Isi hanya setelah program mainnet di-deploy dan diverifikasi:
+VITE_MAINNET_AMM_PROGRAM_ID=
+# VITE_DEVNET_AMM_PROGRAM_ID=   # opsional; default memakai VITE_AMM_PROGRAM_ID
+```
+
+Restart Vite setelah mengubah `.env` atau rebuild bundle produksi. `VITE_*` disertakan dalam browser: **jangan masukkan secret/private key**, dan pahami bahwa key RPC berprefix VITE terlihat oleh pengguna. Set `VITE_MAINNET_AMM_PROGRAM_ID` ke ID program mainnet yang benar; dashboard tidak menganggap deploy devnet tersedia di mainnet. `declare_id!`, binary yang di-deploy dan program ID untuk jaringan tersebut harus cocok. Deploy dapat memerlukan rent dan biaya nyata; petunjuk/npm script deploy yang ada masih untuk devnet.
+
+Dashboard memeriksa genesis hash jaringan dan akun program executable sebelum transaksi dan memeriksanya lagi sebelum mengirim; mainnet dikunci jika konfigurasi tidak valid. **Pemeriksaan ini bukan audit dan tidak membuktikan binary atau upgrade authority aman.** Periksa akun program, hash binary, upgrade authority, dan jaringan wallet secara independen sebelum memakai dana nyata. Pipeline launch terdiri dari beberapa transaksi terpisah: mint mungkin sudah dibuat walau langkah pool gagal; periksa alamat mint dan signature di Explorer sebelum mencoba ulang. Fitur ini belum teruji dengan transaksi mainnet nyata.
+
 ## Authority token baru (Token-2022)
 
 Dashboard menyediakan sakelar **ON/OFF** untuk mint, freeze, dan metadata update authority pada token Token-2022 yang baru dibuat. Default ketiganya OFF; pengguna harus menyetujui bahwa OFF permanen sebelum launch. ON memberi authority tersebut kepada wallet pembuat. Pilihan ini tidak mengubah token yang sudah dibuat, tidak mengubah upgrade authority program, dan tidak menjamin bebas rug pull. Mode SPL Legacy tidak mendukung kontrol ini dan mempertahankan perilaku sebelumnya.
@@ -85,7 +103,7 @@ Dashboard menyediakan sakelar **ON/OFF** untuk mint, freeze, dan metadata update
 - **Freeze OFF**: mint diinisialisasi tanpa freeze authority.
 - **Metadata OFF**: metadata dan sosial ditulis dahulu, kemudian update authority dilepas; MetadataPointer diinisialisasi tanpa authority agar tidak dapat dialihkan. Konten yang dihosting lewat HTTPS di luar chain bisa saja berubah meskipun URI on-chain terkunci.
 
-Transaksi dibuat atomik; jika terlalu besar, pendekkan nama, URI, atau metadata sosial. Uji transaksi dan verifikasi authority di devnet sebelum penggunaan dengan dana nyata. **Sakelar ini tidak menambahkan mode mainnet**; dukungan mainnet dan kesiapan keamanan masih perlu pekerjaan tersendiri.
+Transaksi dibuat atomik; jika terlalu besar, pendekkan nama, URI, atau metadata sosial. Uji transaksi dan verifikasi authority di devnet sebelum penggunaan dengan dana nyata. **Sakelar authority ini bukan jaminan kesiapan atau keamanan mainnet.**
 
 ## Upload Gambar & Metadata ke IPFS via Pinata
 
