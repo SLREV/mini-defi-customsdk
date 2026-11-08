@@ -13,7 +13,9 @@
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "cost": "tsx scripts/cost.ts",
-    "test": "tsx tests/verifyNativePool.ts"
+    "test": "tsx tests/verifyNativePool.ts",
+    "program:build": "node scripts/program-build.mjs",
+    "program:size": "node scripts/program-build.mjs --measure"
   },
   "dependencies": {
     "@solana/buffer-layout": "^4.0.1",

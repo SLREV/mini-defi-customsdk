@@ -37,14 +37,43 @@ Dev server menjalankan middleware `POST /api/pinata/upload` (JSON `{ fileName, b
 description, telegram?, twitter? }` → `{ imageUri, metadataUri }`). **Hanya aktif di `npm run dev`**;
 untuk produksi pindahkan handler yang sama ke backend dan simpan `PINATA_JWT` di server.
 
-## 2. Build & deploy program
+## 2. Build & deploy program (satu perintah)
 
 ```bash
-cd mini-amm-native/program
-cargo build-sbf --release
-ls -l target/deploy/mini_amm_native.so      # ukur dulu
+npm run program:build     # cargo build-sbf --release + ukur .so + hitung biaya deploy
+npm run program:size      # hanya ukur .so yang sudah ada (tanpa build)
+```
+
+Format keluaran (angka di bawah **hanya ilustrasi format** untuk 18 KB; ukuran sebenarnya
+baru diketahui setelah build):
+
+```
+ukuran .so  : 18.432 byte (18.0 KB)
+deploy final : 0.1306 SOL
+puncak deploy: 0.2601 SOL
+```
+
+Manual, bila ingin dua langkah terpisah:
+
+```bash
+cd program && cargo build-sbf --release && ls -l target/deploy/mini_amm_native.so
 cd .. && npm run cost -- --size <ukuran_byte>
 ```
+
+### Tangga pengecilan ukuran `.so`
+
+Ukur tiap langkah dengan `npm run program:size` — jangan menebak.
+
+| Langkah | Efek | Catatan |
+| :--- | :--- | :--- |
+| Tanpa `anchor-lang`/`anchor-spl` (sudah) | puluhan–ratusan KB | penyebab utama `.so` besar |
+| Tanpa `spl-token-2022` (sudah) — `transfer_checked` manual | besar | yang tersisa hanya `solana-program` |
+| `opt-level = "z"` + `lto = "fat"` + `codegen-units = 1` + `strip` (sudah) | beberapa KB | sudah aktif di `program/Cargo.toml` |
+| `panic = "abort"` (sudah) | ~1–3 KB | menghapus tabel unwind |
+| `msg!` di jalur error saja | puluhan byte/`msg!` | format string ikut tersimpan |
+| Hapus `overflow-checks` | ~1–2 KB | **jangan** untuk program AMM |
+
+Target realistis: **15–30 KB**. Setiap 1 KB ≈ **0,00713 SOL** rent.
 
 - Program ID baru muncul di `program/target/deploy/mini_amm_native-keypair.json`. Ganti
   `declare_id!` di `program/src/lib.rs` **dan** `VITE_NATIVE_PROGRAM_ID` di `.env`.
