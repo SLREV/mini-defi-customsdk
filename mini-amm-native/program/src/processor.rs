@@ -156,7 +156,8 @@ fn load_pool_header(
         virtual_reserves_x: read_u64_le(&state, OFFSET_VIRTUAL_X).ok_or(AmmError::InvalidPool)?,
         bump: state[OFFSET_BUMP],
     };
-    Ok((header, [header.bump]))
+    let bump = header.bump;
+    Ok((header, [bump]))
 }
 
 fn verify_pool_pda(

@@ -51,8 +51,10 @@ if (!measureOnly) {
     process.exit(1);
   }
 
-  console.log('→ cargo build-sbf --release (program/)');
-  const build = spawnSync('cargo', ['build-sbf', '--release'], {
+  // `cargo-build-sbf` build release secara default; flag `--release` DITOLAK
+  // ("Found argument '--release' which wasn't expected") pada CLI Solana.
+  console.log('→ cargo build-sbf (program/)');
+  const build = spawnSync('cargo', ['build-sbf'], {
     cwd: programDir,
     stdio: 'inherit',
   });
@@ -69,6 +71,19 @@ if (!soPath) {
   process.exit(1);
 }
 
+// ---------------------------------------------------------------------------
+// Program ID: `cargo build-sbf` TIDAK pernah membuat keypair deploy.
+// ---------------------------------------------------------------------------
+const keypairPath = join(programDir, 'target', 'deploy', 'mini_amm_native-keypair.json');
+if (!existsSync(keypairPath)) {
+  console.log('');
+  console.log('⚠ Keypair program belum ada:', keypairPath.replace(root + '/', ''));
+  console.log('  `cargo build-sbf` hanya menghasilkan .so, bukan keypair deploy.');
+  console.log('  Jalankan:  npm run program:keypair');
+  console.log('  (sinkronkan ID, lalu WAJIB build ulang sebelum deploy)');
+  console.log('  Jika sudah pernah deploy, pulihkan keypair asli dari cadangan.');
+}
+
 const bytes = statSync(soPath).size;
 const programData = rent(bytes + 45);
 const programAccount = rent(36);
@@ -82,7 +97,7 @@ console.log('');
 console.log('program     :', soPath.replace(root + '/', ''));
 console.log('ukuran .so  :', bytes.toLocaleString('en-US'), 'byte', `(${(bytes / 1024).toFixed(1)} KB)`);
 console.log('');
-console.log('deploy final :', sol(final), 'SOL   (rent terkunci, tidak bisa ditarik)');
+console.log('deploy final :', sol(final), 'SOL   (rent terkunci; dapat dipulihkan saat program ditutup sesuai aturan loader)');
 console.log('puncak deploy:', sol(peak), 'SOL   (butuh saldo ≥ ini saat deploy)');
 console.log('per KB       :', perKb.toFixed(4), 'SOL');
 console.log('');

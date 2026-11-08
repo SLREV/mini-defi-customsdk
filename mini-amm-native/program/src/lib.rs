@@ -9,6 +9,12 @@
 //! Wire format (18 byte) identik dengan program Anchor repo induk, jadi SDK/dashboard
 //! yang sudah ada bisa dipakai dengan mengganti `programId`.
 
+// `solana-program` 2.2+ menandai `system_instruction`/`system_program` sebagai deprecated,
+// dan makro `entrypoint!` merujuk cfg `custom-heap`/`custom-panic` yang bukan fitur crate ini.
+// Keduanya hanya warning; dimatikan agar build bersih.
+#![allow(deprecated)]
+#![allow(unexpected_cfgs)]
+
 use solana_program::{
     account_info::AccountInfo, entrypoint::ProgramResult, program_error::ProgramError,
     pubkey::Pubkey,
@@ -16,7 +22,7 @@ use solana_program::{
 
 pub mod processor;
 
-/// GANTI dengan program ID hasil build Anda (`target/deploy/mini_amm_native-keypair.json`).
+// GANTI dengan program ID hasil build Anda (`target/deploy/mini_amm_native-keypair.json`).
 solana_program::declare_id!("A73BhxKr2bktNx7tgZUubMgXrumng17jYfKm5cTdWbXv");
 
 pub const IX_INITIALIZE_POOL: u8 = 0;
