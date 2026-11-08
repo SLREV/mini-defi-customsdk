@@ -292,6 +292,15 @@ serta tombol **Claim Fee**. Tombol hanya aktif bila wallet aktif = `creator` poo
 Panduan lengkap dan sudah diverifikasi terhadap kode: **[`docs/PDA-INTERPOSING-GUIDE.md`](docs/PDA-INTERPOSING-GUIDE.md)**.
 Contoh program Rust: **[`examples/interposer-pda-cpi/`](examples/interposer-pda-cpi/)** (crate terpisah, belum di-build).
 
+### Versi native tanpa Anchor (target biner kecil)
+
+Audit klaim "buang Anchor → `.so` < 15 KB → deploy 0.15 SOL, matematika AMM di frontend":
+**[`docs/NATIVE-SLIM-PROGRAM.md`](docs/NATIVE-SLIM-PROGRAM.md)** (tabel status per klaim, tabel
+rent 10–50 KB, dan alasan kenapa harga **wajib** dihitung on-chain).
+
+Contoh crate: **[`examples/mini-amm-native/`](examples/mini-amm-native/)** — wire-compatible
+dengan `customSdk.ts` (18 byte / 12 akun), tanpa dependency `spl-token-2022`, state pool 81 B.
+
 Ringkasan yang berlaku bila program Anda memakai PDA sebagai `user`/penandatangan:
 
 - **Discriminator 1 byte** (`[0..3]`), jadi CPI harus memakai payload mentah — bukan 8 byte
