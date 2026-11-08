@@ -1,5 +1,10 @@
 # mini-amm-native
 
+> **Jangan gunakan dengan dana nyata.** Pemeriksaan kode menemukan masalah pada
+> susunan akun `transfer_checked`, pembuatan fee vault PDA, dan `InitializeAccount3`.
+> Build sukses tidak membuktikan pool/swap berfungsi. Lihat
+> [`../mini-pool-lite/README.md`](../mini-pool-lite/README.md) untuk rincian dan batas uji.
+
 Program AMM **Native Rust (tanpa Anchor)** + dashboard minimal untuk launch token di mainnet
 dengan biaya sekecil mungkin.
 
