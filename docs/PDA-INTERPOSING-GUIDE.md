@@ -43,6 +43,7 @@ Dokumen ini adalah versi **yang sudah dicek langsung terhadap kode** dari draf p
 | 17 | "hemat ~21 byte per transaksi" | ⚠ | Penghematannya **7 byte per instruksi** (8 → 1 byte). Angka 21 hanya berlaku untuk transaksi berisi 3 instruksi AMM. |
 | 18 | Cukup 12 akun itu untuk swap lewat PDA | ⚠ | Itu hanya akun *CPI-nya*. Program Anda masih wajib: (a) memastikan ATA milik PDA **sudah ada**, (b) membungkus SOL → WSOL lebih dulu bila sisi input adalah SOL, (c) mengunci mint/pool, (d) menegakkan `min_amount_out` sendiri. Lihat §3.2, §3.7. |
 | 19 | "Pakai PDA jadi tidak perlu sewa 1–3 SOL untuk deploy mainnet" | ✘ | Rent = `(128 + ukuran) × 6960` lamports per akun, berlaku juga untuk PDA; deploy membayar akun `ProgramData` milik loader (150 KB ≈ 1.07 SOL, puncak ~2.14 SOL). PDA justru menambah rent (2 ATA ≈ 0.0041 SOL). Lihat §2.6 + `npm run cost:deploy`. |
+| 20 | "Zero rent: menumpang (menulis/realloc) PDA milik SDK publik" | ⚠/✘ | Stateless wrapper memang **benar-benar tanpa rent baru**. Tapi menulis/menambah data ke akun milik program lain **mustahil** — hanya program pemilik yang boleh mengubah data & lamport. mini-amm tidak punya `realloc`/`close`/`remaining_accounts` dan `PoolState` fixed 281 B. Lihat §3.13 + audit H1–H6. |
 
 ---
 
@@ -556,6 +557,51 @@ Yang **tidak mungkin** dengan logika repo ini:
 Kalau nanti butuh hal-hal ini, **baru** program AMM perlu diubah: dukungan `remaining_accounts`
 untuk `TransferHook`, instruksi penarikan likuiditas, atau otorisasi pihak ketiga yang eksplisit
 (mis. `authority` terpisah dari `user`). Untuk sekadar memanggil lewat PDA: tidak perlu.
+
+### 3.13 "Menumpang tanpa rent" — mana yang benar, mana yang mustahil
+
+Klaim intinya **benar**: kalau program Anda tidak membuat akun baru, tidak ada rent baru.
+Itu persis pola di §3.7 — seluruh state (pool, vault, LP mint) sudah dibayar oleh pembuat
+pool. Yang keliru adalah mekanismenya: Anda **tidak bisa** menulis, menambah, atau
+`realloc` ruang milik program lain.
+
+| Strategi di draf | Status | Alasan (aturan runtime Solana) |
+| :--- | :---: | :--- |
+| Logika stateless di instruction data + CPI | ✔ | Tidak membuat akun → tidak ada rent. Ini jalur repo ini. |
+| Memakai PDA publik sebagai akun di CPI | ✔ (read-only) | Boleh dibaca/dipakai sebagai argumen; gratis bagi Anda karena rent-nya sudah dibayar pembuat pool (0.0146 SOL). |
+| "Meminjam slot data" PDA publik untuk state kustom | ✘ | Hanya **program pemilik** akun yang boleh mengubah `data`/menarik lamport. `PoolState` milik mini-amm, vault & ATA milik token program. |
+| `realloc` PDA milik SDK publik | ✘ | `realloc` harus dijalankan program pemilik lewat instruksinya sendiri. mini-amm tidak punya realloc; ruang dialokasikan **sekali** (`space = discriminator + INIT_SPACE`), field fixed-size (audit H1–H3). |
+| Refund saat data dikecilkan | ✘ di repo ini | Butuh instruksi `close`/shrink dari pemilik akun. mini-amm tidak punya (audit H4); lamport akun hanya bisa dipindahkan pemiliknya. |
+| "Rent ditanggung sistem" | ✘ | Rent selalu dibayar `payer` saat akun dibuat — di repo ini pembuat pool. |
+
+#### Zero rent yang benar-benar bisa dicapai di repo ini
+
+| Kebutuhan | Cara tanpa rent | Catatan |
+| :--- | :--- | :--- |
+| Routing/swap | pakai pool yang sudah ada | 0 rent baru. Satu-satunya akun baru: ATA PDA (0.0020 SOL × 2, sekali, dipakai selamanya) |
+| Otoritas | PDA tanpa data, 0 lamport | Bisa jadi signer `invoke_signed` tanpa didanai; tapi tidak bisa menyimpan apa pun |
+| Whitelist / referral | verifikasi **tanda tangan ed25519** atau **Merkle proof** di instruction data | root harus jadi konstanta program (upgrade) atau akun milik Anda (kena rent) |
+| Mencatat referral untuk indexer | `emit!` / `msg!` (log transaksi) | Murah & tanpa rent, tapi **tidak bisa dibaca** program on-chain — hanya indexer/explorer |
+
+> "Tanpa rent" ≠ "tanpa biaya": setiap transaksi tetap membayar 5000 lamports per tanda
+> tangan + priority fee (Anchor 0.31 menambahkan `--with-compute-unit-price` saat deploy).
+> Rent pool 0.0146 SOL itu juga sudah dibayar seseorang.
+
+#### Koreksi pada contoh kode draf
+
+```rust
+// ❌ tidak bisa dikompilasi: `pub_cpi_program = ...` tanpa `let`
+pub_cpi_program = ctx.accounts.program_publik.to_account_info();
+
+// ✅
+let program = ctx.accounts.mini_amm_program.to_account_info();
+```
+
+Selain itu: (a) `data_kustom: Vec<u8>` tidak bisa diteruskan apa adanya ke `swap` — payload
+harus tepat 18 byte `[2, u64_le, u64_le, u8]`; (b) `InstruksiPublik` harus berisi **12 akun**
+swap (§3.3), bukan 2; (c) untuk typed CPI dibutuhkan dependency
+`mini-amm = { path = "...", features = ["cpi"] }` — atau pakai `invoke_signed` mentah seperti
+§3.5 yang tidak menambah dependency apa pun.
 
 ## 4. Jawaban untuk dua pertanyaan penutup
 

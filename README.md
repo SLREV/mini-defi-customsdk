@@ -305,6 +305,10 @@ Ringkasan yang berlaku bila program Anda memakai PDA sebagai `user`/penandatanga
   mini-amm), dan `min_amount_out` dihitung sendiri.
 - **`claim_creator_fee`** hanya berhasil bila `pool.creator` = PDA Anda (yaitu `payer` saat
   `initialize_pool`).
+- **Tanpa state sendiri = tanpa rent baru.** Semua state (pool/vault/lp) sudah dibayar pembuat
+  pool. Tapi Anda **tidak bisa** menulis, menambah, atau `realloc` akun milik program lain —
+  hanya program pemiliknya yang boleh mengubah data/lamport. mini-amm tidak menyediakan
+  `realloc`/`close`/`remaining_accounts`, dan `PoolState` fixed 281 B.
 
 Audit kesiapan PDA: `npx tsx tests/verifyPdaReadiness.ts` (ikut `npm test`) — memeriksa per
 instruksi apakah bisa dijalankan dengan PDA, termasuk syarat seperti WSOL wrap, `pool.creator =

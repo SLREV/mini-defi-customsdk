@@ -20,6 +20,10 @@
  *   G. SDK/dashboard hanya menghasilkan transaksi untuk EOA (feePayer = user, user = signer,
  *      ATA dibuat oleh user) → tidak bisa dipakai untuk MENANDATANGANI transaksi PDA;
  *      hanya berguna sebagai spesifikasi instruksi dalam (CPI).
+ *   H. Klaim "zero rent dengan menumpang PDA publik": tidak ada jalur bagi program lain
+ *      untuk menulis/menambah data ke `PoolState` (tanpa realloc, tanpa remaining_accounts,
+ *      field fixed-size, tanpa close/refund). Jadi "tanpa rent" hanya berlaku bila Anda
+ *      TIDAK membuat state sendiri — bukan dengan meminjam ruang milik program lain.
  */
 
 import assert from 'node:assert/strict';
@@ -33,6 +37,7 @@ import {
   TOKEN_2022_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
 } from '../src/sdk/customSdk';
+import { formatSol, rentExemptLamports } from '../scripts/deployCost';
 
 const LIB_RS = fs.readFileSync(
   new URL('../programs/mini-amm/src/lib.rs', import.meta.url),
@@ -211,6 +216,51 @@ check(
       )[0]
     ),
   'WSOL selalu Tokenkeg, token proyek Token-2022'
+);
+
+// --- H. "Zero rent" dengan menumpang PDA publik: apa yang mungkin ------------
+const poolStateBody = (() => {
+  const start = LIB_RS.indexOf('pub struct PoolState {');
+  assert.ok(start >= 0, 'PoolState tidak ditemukan');
+  return LIB_RS.slice(start, LIB_RS.indexOf('\n}', start));
+})();
+
+check(
+  'H1 program tidak punya jalur realloc',
+  !/realloc/.test(LIB_RS),
+  'tidak ada instruksi yang bisa menumbuhkan PoolState/akun mana pun'
+);
+check(
+  'H2 semua field PoolState fixed-size (Publik, u64, u8)',
+  poolStateBody
+    .split('\n')
+    .map((line) => line.replace(/\/\/.*$/, '').trim())
+    .filter((line) => line.startsWith('pub ') && !line.startsWith('pub struct '))
+    .every((line) => /^pub [a-z0-9_]+: (Pubkey|u64|u8),$/.test(line)),
+  'tidak ada Vec/String/Option: tidak ada slot ekstensi untuk data pihak ketiga'
+);
+check(
+  'H3 alokasi ruang hanya sekali saat init',
+  (LIB_RS.match(/space = /g) ?? []).length === 1 &&
+    /space = PoolState::DISCRIMINATOR\.len\(\) \+ PoolState::INIT_SPACE/.test(LIB_RS),
+  'akun tidak pernah tumbuh setelah initialize_pool'
+);
+check(
+  'H4 tidak ada close/refund akun',
+  !/close\s*=/.test(LIB_RS),
+  'rent yang sudah dibayar tidak bisa di-refund lewat program ini'
+);
+check(
+  'H5 tidak ada akun tambahan untuk menulis data kustom',
+  !LIB_RS.includes('remaining_accounts'),
+  'program lain tidak bisa "menitipkan" state ke akun mini-amm'
+);
+// Rent ATA satu-satunya akun baru yang diperlukan interposer stateless.
+const ataRent = rentExemptLamports(165);
+check(
+  'H6 interposer stateless: rent baru = 0 atau 2 ATA milik PDA',
+  formatSol(ataRent) === '0.0020' && formatSol(ataRent * 2) === '0.0041',
+  'zero rent hanya bila ATA X & Y milik PDA sudah ada (dipakai ulang selamanya)'
 );
 
 // ---------------------------------------------------------------------------
