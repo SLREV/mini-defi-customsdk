@@ -37,12 +37,35 @@ Dev server menjalankan middleware `POST /api/pinata/upload` (JSON `{ fileName, b
 description, telegram?, twitter? }` → `{ imageUri, metadataUri }`). **Hanya aktif di `npm run dev`**;
 untuk produksi pindahkan handler yang sama ke backend dan simpan `PINATA_JWT` di server.
 
-## 2. Build & deploy program (satu perintah)
+## 2. Buat keypair, build, dan deploy program
+
+`cargo build-sbf` tidak membuat keypair deploy. Untuk program **baru**, dari folder
+`mini-amm-native` jalankan:
 
 ```bash
-npm run program:build     # cargo build-sbf --release + ukur .so + hitung biaya deploy
+npm run program:keypair   # buat keypair jika belum ada; sinkronkan declare_id! dan .env
+npm run program:build     # build setelah ID disinkronkan, ukur .so dan estimasi biaya
 npm run program:size      # hanya ukur .so yang sudah ada (tanpa build)
 ```
+
+Jika program sudah pernah di-deploy, **pulihkan keypair aslinya dari cadangan** ke
+`program/target/deploy/mini_amm_native-keypair.json`. Keypair baru menghasilkan ID baru,
+bukan ID lama. Skrip menggunakan keypair yang sudah ada dan tidak menimpanya. File ini
+berisi private key: simpan cadangan di tempat aman, jangan dibagikan atau di-commit.
+Perintah di atas membuat `.env` dari `.env.example` bila belum ada, tanpa menghapus
+pengaturan `.env` yang sudah ada. Setelah mengubah ID, build ulang `.so`; restart
+atau build ulang dashboard agar perubahan `.env` terbaca.
+
+Uji di devnet sebelum mainnet. Setelah siap dan dana mencukupi, contoh deploy mainnet:
+
+```bash
+solana program deploy program/target/deploy/mini_amm_native.so \
+  --program-id program/target/deploy/mini_amm_native-keypair.json \
+  --url mainnet-beta
+```
+
+Pastikan wallet dan upgrade authority CLI benar, dan saldo cukup untuk biaya puncak
+serta biaya transaksi. Proses deploy memerlukan SOL sungguhan.
 
 Format keluaran (angka di bawah **hanya ilustrasi format** untuk 18 KB; ukuran sebenarnya
 baru diketahui setelah build):
@@ -56,7 +79,7 @@ puncak deploy: 0.2601 SOL
 Manual, bila ingin dua langkah terpisah:
 
 ```bash
-cd program && cargo build-sbf --release && ls -l target/deploy/mini_amm_native.so
+cd program && cargo build-sbf && ls -l target/deploy/mini_amm_native.so
 cd .. && npm run cost -- --size <ukuran_byte>
 ```
 
@@ -75,8 +98,6 @@ Ukur tiap langkah dengan `npm run program:size` — jangan menebak.
 
 Target realistis: **15–30 KB**. Setiap 1 KB ≈ **0,00713 SOL** rent.
 
-- Program ID baru muncul di `program/target/deploy/mini_amm_native-keypair.json`. Ganti
-  `declare_id!` di `program/src/lib.rs` **dan** `VITE_NATIVE_PROGRAM_ID` di `.env`.
 - `[profile.release]` (opt-level `z`, LTO fat, strip, overflow-checks) ada di
   `program/Cargo.toml` yang juga root workspace-nya.
 
