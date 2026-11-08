@@ -1,0 +1,9 @@
+{
+  "name": "mini-pool-lite",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Prototipe kuotasi pool saja; belum ada program on-chain",
+  "engines": { "node": ">=18" },
+  "scripts": { "test": "node --test tests/*.test.mjs" }
+}
