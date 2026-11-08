@@ -64,6 +64,8 @@ Anchor 0.31 mendukung **custom discriminator** 1 byte (`#[instruction(discrimina
 ├── tests/
 │   ├── verifySdk.ts             # Uji layout biner, PDA, matematika AMM & deserialisasi
 │   ├── verifyCpiPda.ts          # Uji envelope CPI (12 akun swap, payload, PDA perantara)
+│   ├── verifyPdaReadiness.ts    # Audit: instruksi mana yang bisa jalan lewat PDA
+│   ├── verifyDeployCost.ts      # Uji kalkulator rent deploy & per pool
 │   ├── verifyPinata.ts          # Uji upload Pinata (mock server, tanpa jaringan)
 │   ├── verifyPinataApi.ts       # Uji dev API /api/pinata/* (mock server)
 │   └── verifyClaimCreator.ts    # Uji CLI claim fee creator (mock RPC/ledger)
@@ -71,7 +73,8 @@ Anchor 0.31 mendukung **custom discriminator** 1 byte (`#[instruction(discrimina
 │   ├── devnetPreflight.ts       # Cek kesiapan devnet (RPC, program, saldo)
 │   ├── pinataUpload.ts          # CLI upload gambar + metadata JSON ke IPFS (Pinata)
 │   ├── pinataDevApi.ts          # Dev API /api/pinata/* (Vite middleware, upload dari UI)
-│   └── claimCreatorFee.ts       # CLI klaim fee creator 0.06% (dry-run/--execute)
+│   ├── claimCreatorFee.ts       # CLI klaim fee creator 0.06% (dry-run/--execute)
+│   └── deployCost.ts            # Estimasi SOL: deploy program, per pool, per mint
 ├── docs/
 │   └── PDA-INTERPOSING-GUIDE.md # Panduan terverifikasi: lokal → mainnet → CPI via PDA
 ├── examples/
@@ -309,6 +312,32 @@ payer`, dan tidak adanya `remove_liquidity`. Uji envelope CPI:
 `npx tsx tests/verifyCpiPda.ts`. Keduanya membaca `programs/mini-amm/src/lib.rs` langsung,
 sehingga gagal bila urutan akun/payload berubah.
 
+## Biaya mainnet & hemat modal
+
+Rent Solana adalah **deposit per byte** pada akun, bukan biaya transaksi:
+`(128 + ukuran) × 6960 lamports`. Rumus itu berlaku untuk akun wallet, akun **PDA**, maupun
+akun `ProgramData` milik loader — jadi **memakai PDA tidak menghapus sewa deploy 1–3 SOL**.
+Deploy membayar akun `ProgramData` yang ukurannya mengikuti binary `.so` (≈ 0.00713 SOL per KB):
+
+```bash
+npm run cost:deploy                  # baca target/deploy/mini_amm.so
+npm run cost:deploy -- --size 153600 # simulasi: 150 KB
+```
+
+| Pos | Perkiraan |
+| :--- | :--- |
+| Deploy 150 KB (sekali) | 1.0714 SOL final, puncak 2.1417 SOL (buffer) |
+| Per pool (`initialize_pool`) | 0.0146 SOL — tidak bisa diklaim kembali (tidak ada `close`) |
+| Per mint Token-2022 | ~0.0038 SOL |
+| 2 ATA milik PDA (interposer) | +0.0041 SOL |
+
+Yang benar-benar menghemat: deploy **sekali** lalu banyak pool, uji dulu di devnet (gratis),
+kecilkan `.so` (setiap 10 KB ≈ 0.071 SOL), pakai `--max-len` = ukuran `.so`, dan tutup buffer
+(`solana program close <BUFFER>`) kalau deploy gagal. `anchor deploy` 0.31.1 tidak membuat akun
+IDL on-chain, jadi tidak ada rent IDL.
+
+Rincian lengkap + tabel: [`docs/PDA-INTERPOSING-GUIDE.md` §2.6](docs/PDA-INTERPOSING-GUIDE.md#26-mitos-pakai-pda-jadi-tidak-perlu-sewa-13-sol).
+
 ## Instal dari Nol di Linux (belum ada Node.js)
 
 Node.js dari repo distro sering terlalu tua untuk Vite 6. Pakai **nvm** (tanpa sudo, tidak mengganggu paket sistem):
@@ -365,6 +394,7 @@ npm run dev      # Dashboard interaktif di http://localhost:5173 (0.0.0.0)
 
 npm run claim:creator -- --pool <POOL_PDA>   # Cek fee creator yang bisa diklaim (dry-run)
 npm run toolchain:check  # Cek toolchain SBF (rustc/Cargo untuk `anchor build`)
+npm run cost:deploy      # Estimasi SOL: rent deploy (dari ukuran .so), per pool, per mint
 
 anchor build     # Build smart contract Rust (butuh Anchor CLI 0.31.1 + Agave >= 4.0)
 anchor deploy    # Deploy program mini_amm ke devnet

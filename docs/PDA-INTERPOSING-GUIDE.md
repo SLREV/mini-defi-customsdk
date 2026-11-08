@@ -42,6 +42,7 @@ Dokumen ini adalah versi **yang sudah dicek langsung terhadap kode** dari draf p
 | 16 | `let seeds = &[b"otoritas_pda_anda", &[pda_bump]];` | ✘ | **Tidak bisa dikompilasi**: elemen array bertipe beda (`&[u8; 18]` vs `&[u8; 1]`). Perbaikan di §3.5. |
 | 17 | "hemat ~21 byte per transaksi" | ⚠ | Penghematannya **7 byte per instruksi** (8 → 1 byte). Angka 21 hanya berlaku untuk transaksi berisi 3 instruksi AMM. |
 | 18 | Cukup 12 akun itu untuk swap lewat PDA | ⚠ | Itu hanya akun *CPI-nya*. Program Anda masih wajib: (a) memastikan ATA milik PDA **sudah ada**, (b) membungkus SOL → WSOL lebih dulu bila sisi input adalah SOL, (c) mengunci mint/pool, (d) menegakkan `min_amount_out` sendiri. Lihat §3.2, §3.7. |
+| 19 | "Pakai PDA jadi tidak perlu sewa 1–3 SOL untuk deploy mainnet" | ✘ | Rent = `(128 + ukuran) × 6960` lamports per akun, berlaku juga untuk PDA; deploy membayar akun `ProgramData` milik loader (150 KB ≈ 1.07 SOL, puncak ~2.14 SOL). PDA justru menambah rent (2 ATA ≈ 0.0041 SOL). Lihat §2.6 + `npm run cost:deploy`. |
 
 ---
 
@@ -161,7 +162,79 @@ Biaya = rent-exempt akun `ProgramData`, rumus Solana `(128 + ukuran) × 6960 lam
 | 400 KB | 2.852 SOL | ~5.71 SOL |
 
 \* `solana program deploy` membuat buffer account berukuran sama, jadi dana yang harus ada
-sesaat deploy ≈ 2× rent final + fee. Ukur `.so` Anda, jangan pakai angka tabel.
+sesaat deploy ≈ 2× rent final + fee. Ukur `.so` Anda, jangan pakai angka tabel:
+
+```bash
+npm run cost:deploy                 # membaca target/deploy/mini_amm.so
+npm run cost:deploy -- --size 153600
+```
+
+### 2.6 Mitos "pakai PDA jadi tidak perlu sewa 1–3 SOL"
+
+**Tidak benar.** Rent di Solana adalah **deposit per byte pada akun**, bukan biaya per
+transaksi atau per tanda tangan:
+
+```text
+rent_exempt = (128 + ukuran_data_byte) × 3480 lamports/byte-tahun × 2 tahun
+            = (128 + ukuran) × 6960 lamports
+```
+
+Rumus itu berlaku sama untuk akun milik keypair, akun **PDA**, maupun akun milik BPF loader.
+PDA tidak mengecualikan apa pun.
+
+Saat `anchor deploy`, yang dibayar adalah dua akun milik **loader** — bukan akun program Anda:
+
+| Akun | Ukuran | Keterangan |
+| :--- | :--- | :--- |
+| `Program` | 36 B | 0.00114 SOL |
+| `ProgramData` | ukuran `.so` + 45 B | ~0.00713 SOL per 1 KB binary |
+| buffer deploy | = `ProgramData` | dipakai sementara, kembali saat sukses |
+
+Angka nyata (`npm run cost:deploy`, sudah diuji di `tests/verifyDeployCost.ts`):
+
+| Ukuran `.so` | Rent final (terkunci) | Puncak dana saat deploy |
+| :--- | :--- | :--- |
+| 100 KB | 0.7150 SOL | 1.4290 SOL |
+| 150 KB | 1.0714 SOL | 2.1417 SOL |
+| 250 KB | 1.7841 SOL | 3.5671 SOL |
+| 400 KB | 2.8532 SOL | 5.7052 SOL |
+
+Jadi estimasi Anda "1–3 SOL" memang wajar — **yang keliru hanya anggapan bahwa PDA
+menghapusnya**. Rent itu deposit, bukan fee: secara teori bisa diambil lagi hanya dengan
+`solana program close` (program mati dan tidak bisa dipakai lagi), jadi untuk produk yang
+berjalan ia praktis menjadi modal terkunci.
+
+**PDA justru menambah** kebutuhan rent, bukan mengurangi:
+
+| Pos | Ukuran | Rent |
+| :--- | :---: | :--- |
+| Per pool (`initialize_pool`) | 289 + 82 + 4×165 + 165 B | **0.0146 SOL** |
+| \+ 2 ATA milik PDA (untuk interposer) | 2×165 B | +0.0041 SOL → **0.0186 SOL** |
+| Mint Token-2022 (MetadataPointer + metadata) | ~419 B | **0.0038 SOL** |
+
+Repo ini **tidak punya** instruksi `close`/`remove_liquidity`, jadi rent pool/vault tidak
+bisa diklaim kembali. Setiap pool uji-coba di mainnet = 0.0146 SOL yang hilang permanen.
+
+#### Yang benar-benar menghemat modal
+
+| Cara | Penghematan (angka nyata) |
+| :--- | :--- |
+| **Deploy sekali, banyak pool** (model repo ini) | biaya deploy tidak berulang; 10 pool tetap 1× deploy |
+| **Uji di devnet dulu** | SOL devnet gratis lewat `solana airdrop` |
+| **Kecilkan `.so`** (`opt-level = "z"`, `strip = true`, buang dependency tak terpakai) | setiap **10 KB ≈ 0.071 SOL** |
+| **`--max-len` = ukuran `.so` sebenarnya** | hindari padding yang tidak dipakai |
+| **Deploy gagal → `solana program close <BUFFER>`** | kembalikan rent buffer (bisa >1 SOL) |
+| **Jangan bikin pool/mint uji di mainnet** | 0.0146 SOL per pool, 0.0038 SOL per mint |
+| **Tidak ada akun IDL on-chain** | `anchor deploy` 0.31.1 hanya menulis `target/idl/*.json` lokal → 0 rent IDL |
+
+PDA tetap berguna, hanya bukan untuk ini: ia menghilangkan keypair otoritas yang harus
+dikelola, menghilangkan satu tanda tangan transaksi (5000 lamports/tanda tangan), dan memberi
+alamat deterministik. Ia **tidak** menghapus rent — termasuk rent akun PDA itu sendiri kalau
+PDA menyimpan data.
+
+> Kalau target Anda semata-mata "hemat modal deploy": jangan deploy program AMM sendiri.
+> Deploy sekali lalu pakai untuk semua token, atau bangun interposer di atas AMM yang sudah
+> ada — konsekuensinya Anda mewarisi risiko dan biaya program pihak lain.
 
 Wallet provider (`~/.config/solana/id.json`, lihat `Anchor.toml:32`) menjadi **upgrade
 authority**. Untuk dana nyata, pertimbangkan memindahkan authority ke multisig
