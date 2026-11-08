@@ -298,8 +298,9 @@ Audit klaim "buang Anchor → `.so` < 15 KB → deploy 0.15 SOL, matematika AMM 
 **[`docs/NATIVE-SLIM-PROGRAM.md`](docs/NATIVE-SLIM-PROGRAM.md)** (tabel status per klaim, tabel
 rent 10–50 KB, dan alasan kenapa harga **wajib** dihitung on-chain).
 
-Contoh crate: **[`examples/mini-amm-native/`](examples/mini-amm-native/)** — wire-compatible
-dengan `customSdk.ts` (18 byte / 12 akun), tanpa dependency `spl-token-2022`, state pool 81 B.
+Proyek siap pakai: **[`mini-amm-native/`](mini-amm-native/)** — program Rust native (init/fund/swap,
+tanpa dependency `spl-token-2022`, state pool 81 B) + dashboard minimal tanpa React/Tailwind.
+Wire-compatible dengan `customSdk.ts` (swap 18 byte / 12 akun).
 
 Ringkasan yang berlaku bila program Anda memakai PDA sebagai `user`/penandatangan:
 

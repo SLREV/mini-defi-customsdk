@@ -1,0 +1,29 @@
+{
+  "name": "mini-amm-native",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Dashboard minimal + program AMM native Rust (tanpa Anchor) untuk deploy mainnet semurah mungkin",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "cost": "tsx scripts/cost.ts",
+    "test": "tsx tests/verifyNativePool.ts"
+  },
+  "dependencies": {
+    "@solana/buffer-layout": "^4.0.1",
+    "@solana/web3.js": "^1.98.0",
+    "buffer": "^6.0.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.5"
+  }
+}

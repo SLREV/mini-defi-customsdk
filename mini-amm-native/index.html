@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="id">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Mini AMM Native — Launch Ringan</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Mini AMM <span>native</span></h1>
+      <p class="tagline">
+        Program Rust tanpa Anchor. State pool 81 byte. Harga dihitung on-chain.
+      </p>
+      <div class="wallet-row">
+        <span id="wallet">Belum terhubung</span>
+        <span id="balance" class="dim"></span>
+        <button id="connect" type="button">Hubungkan Wallet</button>
+      </div>
+    </header>
+
+    <main>
+      <section class="card">
+        <h2>1 · Jaringan</h2>
+        <div class="grid2">
+          <label>
+            Cluster
+            <select id="cluster">
+              <option value="devnet">devnet</option>
+              <option value="mainnet-beta">mainnet-beta</option>
+            </select>
+          </label>
+          <label>
+            RPC (opsional)
+            <input id="rpc" type="text" placeholder="https://api.devnet.solana.com" />
+          </label>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>2 · Form token</h2>
+        <div class="grid2">
+          <label>
+            Nama token
+            <input id="name" type="text" maxlength="32" placeholder="Contoh: Kucing Cikarang" />
+          </label>
+          <label>
+            Simbol
+            <input id="symbol" type="text" maxlength="10" placeholder="KCG" />
+          </label>
+        </div>
+        <label>
+          Deskripsi
+          <textarea id="description" rows="2" maxlength="200" placeholder="Deskripsi singkat"></textarea>
+        </label>
+        <div class="grid2">
+          <label>
+            Telegram (opsional)
+            <input id="telegram" type="text" placeholder="https://t.me/..." />
+          </label>
+          <label>
+            Twitter (opsional)
+            <input id="twitter" type="text" placeholder="https://x.com/..." />
+          </label>
+        </div>
+        <div class="grid2">
+          <label>
+            Logo (png/jpg/webp, maks 2 MB)
+            <input id="logo" type="file" accept="image/png,image/jpeg,image/webp" />
+          </label>
+          <label>
+            Total supply
+            <input id="supply" type="text" value="1000000000" />
+          </label>
+        </div>
+        <div class="grid2">
+          <label>
+            Likuiditas virtual (SOL)
+            <input id="virtualSol" type="text" value="30" />
+          </label>
+          <label>
+            Token untuk pool (dari supply)
+            <input id="poolTokens" type="text" value="800000000" />
+          </label>
+        </div>
+        <div class="actions">
+          <button id="upload" type="button" class="ghost">Unggah logo ke IPFS</button>
+          <button id="launch" type="button">Launch token + pool</button>
+        </div>
+        <p id="status" class="status">Siap.</p>
+        <p id="ipfs" class="dim small"></p>
+      </section>
+
+      <section class="card">
+        <h2>3 · Pool &amp; beli</h2>
+        <div id="poolInfo" class="mono small">Pool belum dibuat.</div>
+        <div class="grid2">
+          <label>
+            Beli dengan (SOL)
+            <input id="buyAmount" type="text" value="0.1" />
+          </label>
+          <div class="actions">
+            <button id="buy" type="button" class="ghost" disabled>Beli token</button>
+          </div>
+        </div>
+        <p id="quote" class="dim small"></p>
+      </section>
+
+      <section class="card">
+        <h2>4 · Biaya (hemat modal)</h2>
+        <label>
+          Ukuran file <code>.so</code> hasil build (KB)
+          <input id="soSize" type="text" value="15" />
+        </label>
+        <table class="cost">
+          <tbody>
+            <tr><td>Deploy program</td><td id="costDeploy">–</td></tr>
+            <tr><td>Mint Token-2022 + metadata</td><td id="costMint">–</td></tr>
+            <tr><td>State pool (81 B) + 2 ATA + 2 fee vault</td><td id="costPool">–</td></tr>
+            <tr><td>ATA user (token + WSOL)</td><td id="costAta">–</td></tr>
+            <tr><td>Biaya transaksi (perkiraan)</td><td id="costFee">–</td></tr>
+            <tr class="total"><td>Total</td><td id="costTotal">–</td></tr>
+          </tbody>
+        </table>
+        <p class="dim small">
+          Rumus sewa: <code>(128 + byte) × 6960</code> lamports. Sewa tidak bisa ditarik kembali.
+        </p>
+      </section>
+
+      <section class="card">
+        <h2>Log</h2>
+        <pre id="log" class="log"></pre>
+      </section>
+    </main>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

@@ -6,7 +6,7 @@ frontend (stateless)". Setiap klaim diberi status `✔`, `⚠`, atau `✘`.
 - Lingkungan penyusunan: **tidak ada Rust/SBF toolchain**, jadi ukuran biner tidak bisa
   diukur di sini. Semua angka rent dihitung dari rumus Solana dan bisa Anda ulang dengan
   `npm run cost:deploy -- --size <byte>`.
-- Contoh program yang aman: [`examples/mini-amm-native/`](../examples/mini-amm-native/).
+- Proyek lengkap (program + dashboard): [`mini-amm-native/`](../mini-amm-native/).
 - Uji serangan/paritas matematika: `tests/verifyNativeInvariant.ts` (ikut `npm test`).
 
 ---
@@ -130,7 +130,7 @@ Tambahan: `transfer_checked` versi Token-2022 memakai urutan akun `[mint, source
 
 ## 6. Wire format: biarkan tetap 18 byte / 12 akun
 
-Contoh di `examples/mini-amm-native/` sengaja mempertahankan format yang sama dengan program
+Contoh di `mini-amm-native/program/` sengaja mempertahankan format yang sama dengan program
 Anchor, sehingga `customSdk.ts` **tidak perlu ditulis ulang** — cukup ganti `programId`:
 
 ```text
@@ -205,7 +205,7 @@ mkdir mini-amm-native && cd mini-amm-native
 # salin file frontend + sdk + scripts seperti tabel di atas
 # lalu buat crate native:
 mkdir -p programs/mini-amm-native/src
-# salin examples/mini-amm-native/{Cargo.toml,src/*} -> programs/mini-amm-native/
+# crate & dashboard sudah tersedia utuh di mini-amm-native/ (tidak perlu disalin)
 cargo build-sbf --release --manifest-path programs/mini-amm-native/Cargo.toml
 ls -l target/deploy/*.so            # ukur dulu, baru hitung rent
 ```

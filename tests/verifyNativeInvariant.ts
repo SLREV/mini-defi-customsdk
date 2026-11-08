@@ -1,5 +1,5 @@
 /**
- * Uji desain program native "tipis" (`examples/mini-amm-native/`) — dua hal:
+ * Uji desain program native "tipis" (`mini-amm-native/program/`) — dua hal:
  *
  *   A. PARITAS: matematika on-chain di `processor.rs` harus sama dengan
  *      `calculateSwapOutput` di SDK, sehingga klien bisa memakai SDK untuk
