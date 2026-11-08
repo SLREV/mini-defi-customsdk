@@ -1,0 +1,32 @@
+[workspace]
+# Crate contoh berdiri sendiri: tidak ikut workspace Anchor repo (`members = ["programs/*"]`)
+# dan tidak ikut `anchor build`.
+
+[package]
+name = "mini-amm-native"
+version = "0.1.0"
+edition = "2021"
+publish = false
+rust-version = "1.84"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "mini_amm_native"
+
+[features]
+default = []
+no-entrypoint = []
+
+[dependencies]
+# Sengaja HANYA solana-program: builder `transfer_checked` dibuat manual agar biner kecil.
+# Menambah `spl-token-2022` akan menarik spl-token/spl-pod/bytemuck dan membengkakkan .so.
+solana-program = "2.1"
+
+[profile.release]
+# Ukuran minimum, tapi AMM tetap butuh overflow-checks.
+overflow-checks = true
+lto = "fat"
+opt-level = "z"
+codegen-units = 1
+panic = "abort"
+strip = true
