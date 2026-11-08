@@ -1,0 +1,24 @@
+[workspace]
+# Sengaja kosong: crate contoh ini BERDIRI SENDIRI agar tidak ikut workspace
+# mini-amm (`members = ["programs/*"]`) dan tidak ikut `anchor build`.
+
+[package]
+name = "interposer-pda-cpi"
+version = "0.1.0"
+edition = "2021"
+publish = false
+# Selaras dengan program mini-amm (lihat programs/mini-amm/Cargo.toml).
+rust-version = "1.84"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "interposer_pda_cpi"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+
+[dependencies]
+anchor-lang = "0.31.1"
+anchor-spl = { version = "0.31.1", features = ["token", "token_2022"] }

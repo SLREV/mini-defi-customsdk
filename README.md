@@ -63,6 +63,7 @@ Anchor 0.31 mendukung **custom discriminator** 1 byte (`#[instruction(discrimina
 │   └── sdk/customSdk.ts         # SDK biner murni (buffer-layout, tanpa SDK pihak ketiga)
 ├── tests/
 │   ├── verifySdk.ts             # Uji layout biner, PDA, matematika AMM & deserialisasi
+│   ├── verifyCpiPda.ts          # Uji envelope CPI (12 akun swap, payload, PDA perantara)
 │   ├── verifyPinata.ts          # Uji upload Pinata (mock server, tanpa jaringan)
 │   ├── verifyPinataApi.ts       # Uji dev API /api/pinata/* (mock server)
 │   └── verifyClaimCreator.ts    # Uji CLI claim fee creator (mock RPC/ledger)
@@ -71,6 +72,10 @@ Anchor 0.31 mendukung **custom discriminator** 1 byte (`#[instruction(discrimina
 │   ├── pinataUpload.ts          # CLI upload gambar + metadata JSON ke IPFS (Pinata)
 │   ├── pinataDevApi.ts          # Dev API /api/pinata/* (Vite middleware, upload dari UI)
 │   └── claimCreatorFee.ts       # CLI klaim fee creator 0.06% (dry-run/--execute)
+├── docs/
+│   └── PDA-INTERPOSING-GUIDE.md # Panduan terverifikasi: lokal → mainnet → CPI via PDA
+├── examples/
+│   └── interposer-pda-cpi/      # Contoh program perantara (crate terpisah, belum di-build)
 ├── index.html
 ├── tailwind.config.js           # content: index.html + src/**/*.{ts,tsx}
 ├── tsconfig.json                # include: src, tests
@@ -275,6 +280,32 @@ serta tombol **Claim Fee**. Tombol hanya aktif bila wallet aktif = `creator` poo
 - `Belum ada fee creator yang terakumulasi` → fee 0.06% baru terisi setelah ada swap.
 - Di mode **Binary Sandbox**, tombol Claim hanya mengosongkan fee vault pada ledger lokal
   (tidak ada transaksi on-chain).
+
+## Memanggil AMM lewat program perantara (CPI + PDA)
+
+Panduan lengkap dan sudah diverifikasi terhadap kode: **[`docs/PDA-INTERPOSING-GUIDE.md`](docs/PDA-INTERPOSING-GUIDE.md)**.
+Contoh program Rust: **[`examples/interposer-pda-cpi/`](examples/interposer-pda-cpi/)** (crate terpisah, belum di-build).
+
+Ringkasan yang berlaku bila program Anda memakai PDA sebagai `user`/penandatangan:
+
+- **Discriminator 1 byte** (`[0..3]`), jadi CPI harus memakai payload mentah — bukan 8 byte
+  `sha256("global:swap")`. `swap` = `[u8(2), u64_le(amount_in), u64_le(min_amount_out), u8(x_to_y)]`
+  (18 byte, `x_to_y` hanya `0`/`1`).
+- **`swap` butuh 12 akun** dengan urutan tetap: `user, token_x, token_y, pool_state, vault_x,
+  vault_y, fee_vault_x, fee_vault_y, user_token_x, user_token_y, token_program_x, token_program_y`.
+  `pool_state` read-only; vault & ATA writable.
+- **PDA tidak menandatangani transaksi top-level.** Ia menjadi signer hanya di dalam frame CPI
+  (`invoke_signed` + seeds `[b"seed_anda", &[bump]]`). Karena itu `buildSwapTx()` di SDK ini
+  (dirancang untuk wallet/EOA) tidak bisa dipakai langsung untuk PDA.
+- **Prasyarat di sisi Anda:** ATA milik PDA sudah ada, saldo/WSOL sudah disiapkan (mini-amm tidak
+  pernah wrap/unwrap SOL), mint + `pool_state` dikunci (PDA pool diturunkan dari program ID
+  mini-amm), dan `min_amount_out` dihitung sendiri.
+- **`claim_creator_fee`** hanya berhasil bila `pool.creator` = PDA Anda (yaitu `payer` saat
+  `initialize_pool`).
+
+Uji envelope CPI tanpa validator: `npx tsx tests/verifyCpiPda.ts` (ikut dijalankan oleh `npm test`).
+Tes itu membaca `programs/mini-amm/src/lib.rs` langsung, sehingga gagal bila urutan akun atau
+payload berubah.
 
 ## Instal dari Nol di Linux (belum ada Node.js)
 
