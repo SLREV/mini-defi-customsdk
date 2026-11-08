@@ -303,9 +303,11 @@ Ringkasan yang berlaku bila program Anda memakai PDA sebagai `user`/penandatanga
 - **`claim_creator_fee`** hanya berhasil bila `pool.creator` = PDA Anda (yaitu `payer` saat
   `initialize_pool`).
 
-Uji envelope CPI tanpa validator: `npx tsx tests/verifyCpiPda.ts` (ikut dijalankan oleh `npm test`).
-Tes itu membaca `programs/mini-amm/src/lib.rs` langsung, sehingga gagal bila urutan akun atau
-payload berubah.
+Audit kesiapan PDA: `npx tsx tests/verifyPdaReadiness.ts` (ikut `npm test`) — memeriksa per
+instruksi apakah bisa dijalankan dengan PDA, termasuk syarat seperti WSOL wrap, `pool.creator =
+payer`, dan tidak adanya `remove_liquidity`. Uji envelope CPI:
+`npx tsx tests/verifyCpiPda.ts`. Keduanya membaca `programs/mini-amm/src/lib.rs` langsung,
+sehingga gagal bila urutan akun/payload berubah.
 
 ## Instal dari Nol di Linux (belum ada Node.js)
 

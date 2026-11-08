@@ -13,6 +13,11 @@ Dokumen ini adalah versi **yang sudah dicek langsung terhadap kode** dari draf p
 - Dokumen ini bukan audit. Program belum diaudit dan belum pernah diuji dengan transaksi
   mainnet sungguhan.
 
+> **Jawaban singkat "apakah bisa jalan lewat PDA?": ya, untuk `swap` — tanpa mengubah program
+> AMM sama sekali.** Rincian per instruksi, syarat, dan hal yang tidak mungkin ada di
+> [§3.12](#312-kesiapan-repo-ini-untuk-jalur-pda-audit-otomatis), diperiksa otomatis oleh
+> `tests/verifyPdaReadiness.ts`.
+
 ---
 
 ## 0. Hasil pemeriksaan draf (baca ini dulu)
@@ -421,6 +426,63 @@ Framework/SPL yang sering muncul di jalur CPI:
 - [ ] Program belum diaudit; uji di devnet dengan dana kecil sebelum mainnet.
 
 ---
+
+### 3.12 Kesiapan repo ini untuk jalur PDA (audit otomatis)
+
+Jawaban singkat: **ya, untuk `swap` — tanpa mengubah satu baris pun program AMM.** Yang
+membuatnya bisa adalah: `user` hanya `Signer` biasa (tidak ada constraint wallet manusia),
+program tidak memakai `remaining_accounts`, dan `swap` sama sekali tidak menyentuh lamport.
+Semua sifat itu diperiksa ulang setiap `npm test` oleh `tests/verifyPdaReadiness.ts`
+(membaca `lib.rs` + `customSdk.ts`, 16 pemeriksaan).
+
+| Instruksi | Akun | Bisa lewat PDA? | Syarat tambahan |
+| :--- | :---: | :--- | :--- |
+| `initialize_pool` | 17 | **BISA** | PDA harus punya SOL untuk rent ~0.0146 SOL + ATA, dan saldo token Y |
+| `add_liquidity` | 13 | **BISA, dengan catatan** | LP + ATA X/Y milik PDA; **LP tidak bisa ditarik** (tidak ada `remove_liquidity`) |
+| `swap` | 12 | **BISA (jalur utama)** | ATA X & Y milik PDA sudah ada; WSOL dibungkus di luar AMM |
+| `claim_creator_fee` | 10 | **Hanya bila PDA = `pool.creator`** | Pool harus dibuat oleh PDA (`payer` = PDA) |
+
+Lima hal yang khas repo ini dan harus Anda tangani:
+
+1. **Token X default = WSOL, dan AMM tidak pernah menyentuh lamport** (`swap` murni
+   `transfer_checked`). Membungkus SOL → WSOL **tidak butuh tanda tangan PDA**, jadi bisa
+   dilakukan klien di transaksi yang sama, atau di dalam program Anda. Menutup ATA WSOL
+   (`CloseAccount`) baru butuh `invoke_signed`.
+2. **`pool.creator = payer`** (`lib.rs:60`). Artinya fee 0.06% mengikuti siapa yang membayar
+   pool. PDA yang membuat pool = PDA yang menerima fee. Pool yang dibuat wallet lewat dashboard
+   **tidak** bisa diklaim PDA (`has_one = creator`, `lib.rs:884`).
+3. **Tidak ada `remove_liquidity`/`withdraw`.** Kalau PDA ikut `add_liquidity`, likuiditasnya
+   terkunci. Untuk interposer routing, cukup pakai `swap` saja.
+4. **Tidak ada `remaining_accounts` sama sekali.** Konsekuensi: mint Token-2022 dengan
+   `TransferHook` tidak bisa di-swap (butuh akun hook tambahan). Mint buatan repo ini aman —
+   hanya `MetadataPointer` + `TokenMetadata`, tanpa `TransferFee`/`TransferHook`.
+5. **SDK & dashboard hanya untuk EOA.** `buildSwapTx` menjadikan `user` sebagai `feePayer`,
+   signer, sekaligus pembayar ATA — mustahil untuk PDA, karena transaksi top-level tidak bisa
+   ditandatangani PDA. Pakai SDK hanya sebagai **spesifikasi instruksi dalam**.
+
+Kerangka satu transaksi (pengguna bayar SOL, menerima token Y, lewat PDA):
+
+```text
+tx (ditandatangani wallet pengguna):
+  1. [sekali saja] CreateIdempotent ATA PDA-X (WSOL) + ATA PDA-Y
+  2. SystemProgram.transfer : pengguna → ATA WSOL milik PDA   (amount_in)
+  3. SyncNative             : ATA WSOL milik PDA              (token_program_x, data [17])
+  4. instruksi program Anda → CPI `swap` 12 akun              (PDA signer via invoke_signed)
+  5. [opsional] CloseAccount ATA WSOL PDA → pengguna          (butuh tanda tangan PDA)
+```
+
+Yang **tidak mungkin** dengan logika repo ini:
+
+- PDA menjadi fee payer transaksi — biaya selalu dibayar wallet.
+- PDA menandatangani transaksi top-level — hanya lewat CPI (`invoke_signed`).
+- Mengendarai alur PDA dari dashboard (Sandbox/Devnet/Mainnet) — dashboard hanya wallet;
+  jalur PDA sepenuhnya on-chain dari program perantara Anda.
+- Menguji jalur PDA di **Binary Sandbox** — sandbox adalah ledger in-memory tanpa eksekusi CPI;
+  perlu `solana-test-validator` + program perantara ter-deploy.
+
+Kalau nanti butuh hal-hal ini, **baru** program AMM perlu diubah: dukungan `remaining_accounts`
+untuk `TransferHook`, instruksi penarikan likuiditas, atau otorisasi pihak ketiga yang eksplisit
+(mis. `authority` terpisah dari `user`). Untuk sekadar memanggil lewat PDA: tidak perlu.
 
 ## 4. Jawaban untuk dua pertanyaan penutup
 
