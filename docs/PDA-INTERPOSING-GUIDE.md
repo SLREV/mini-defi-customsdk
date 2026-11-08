@@ -269,6 +269,46 @@ Program devnet **tidak** otomatis ada di mainnet; pool, mint, dan saldo tidak ik
 
 ---
 
+### 2.7 Biaya membuat token (dan pool) lewat SDK ini
+
+Dihitung dari jalur kode sebenarnya (`buildCloneTokenInstructions` → `buildCreatePoolTx`),
+bukan perkiraan. Jalankan sendiri dengan nama/URI Anda: `npm run cost:launch`.
+
+| Pos | Ukuran | Biaya |
+| :--- | ---: | ---: |
+| Mint Token-2022 (MetadataPointer + TokenMetadata, contoh 493 B) | 493 B | 0.004322 SOL |
+| ATA token milik payer | 165 B | 0.002039 SOL |
+| Fee tx#1 (2 tanda tangan: payer + keypair mint) | — | 0.000010 SOL |
+| **Token saja** | | **0.006371 SOL** |
+| PoolState | 289 B | 0.002902 SOL |
+| LP mint | 82 B | 0.001462 SOL |
+| vault_x, vault_y, fee_vault_x, fee_vault_y | 4×165 B | 0.008157 SOL |
+| ATA LP + ATA token Y | 2×165 B | 0.004078 SOL |
+| Fee tx#2 | — | 0.000005 SOL |
+| **Token + pool** | | **0.022976 SOL** |
+
+- Mode SPL legacy (tanpa metadata on-chain): token 0.003511 SOL → total 0.020115 SOL.
+- Ukuran mint mengikuti panjang nama/simbol/URI/telegram/twitter; URI IPFS panjang
+  menambah beberapa ratus byte (≈ 0.0007 SOL per 100 B).
+- Priority fee tidak termasuk (tergantung jaringan); tambahkan
+  `--cu-price 10000 --cu 200000` untuk mengikutsertakannya.
+- Semua rent di atas **tidak bisa diklaim kembali** — program ini tidak punya `close`.
+
+### 2.8 Memeriksa biaya wallet yang sudah bertransaksi
+
+Sandbox pengembangan repo ini tidak punya akses RPC, jadi pemeriksaan riwayat harus
+dijalankan di mesin Anda:
+
+```bash
+npm run cost:wallet -- --address <WALLET> --rpc https://<RPC-anda> --limit 50
+npm run cost:wallet -- --address <WALLET> --rpc <RPC> --days 1        # 24 jam terakhir
+```
+
+Skrip menghitung `meta.fee` + lamports yang benar-benar dikunci pada akun yang **dibuat**
+(`system.createAccount` top-level & inner, plus `associated-token-account` create — yang
+idempoten hanya dihitung bila akunnya memang baru), lalu menandai transaksi yang memakai
+Token-2022 / ATA / program mini-amm.
+
 ## 3. Menumpang (interposing) lewat PDA on-chain
 
 ### 3.1 Model mental tanda tangan

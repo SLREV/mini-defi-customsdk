@@ -66,6 +66,7 @@ Anchor 0.31 mendukung **custom discriminator** 1 byte (`#[instruction(discrimina
 │   ├── verifyCpiPda.ts          # Uji envelope CPI (12 akun swap, payload, PDA perantara)
 │   ├── verifyPdaReadiness.ts    # Audit: instruksi mana yang bisa jalan lewat PDA
 │   ├── verifyDeployCost.ts      # Uji kalkulator rent deploy & per pool
+│   ├── verifyCostTools.ts       # Uji model biaya launch & pembaca riwayat wallet
 │   ├── verifyPinata.ts          # Uji upload Pinata (mock server, tanpa jaringan)
 │   ├── verifyPinataApi.ts       # Uji dev API /api/pinata/* (mock server)
 │   └── verifyClaimCreator.ts    # Uji CLI claim fee creator (mock RPC/ledger)
@@ -74,7 +75,9 @@ Anchor 0.31 mendukung **custom discriminator** 1 byte (`#[instruction(discrimina
 │   ├── pinataUpload.ts          # CLI upload gambar + metadata JSON ke IPFS (Pinata)
 │   ├── pinataDevApi.ts          # Dev API /api/pinata/* (Vite middleware, upload dari UI)
 │   ├── claimCreatorFee.ts       # CLI klaim fee creator 0.06% (dry-run/--execute)
-│   └── deployCost.ts            # Estimasi SOL: deploy program, per pool, per mint
+│   ├── deployCost.ts            # Estimasi SOL: deploy program, per pool, per mint
+│   ├── launchCost.ts            # Model biaya launch token (+pool) dari jalur SDK
+│   └── walletCost.ts            # Baca riwayat wallet: fee + rent akun baru (butuh RPC)
 ├── docs/
 │   └── PDA-INTERPOSING-GUIDE.md # Panduan terverifikasi: lokal → mainnet → CPI via PDA
 ├── examples/
@@ -340,7 +343,20 @@ kecilkan `.so` (setiap 10 KB ≈ 0.071 SOL), pakai `--max-len` = ukuran `.so`, d
 (`solana program close <BUFFER>`) kalau deploy gagal. `anchor deploy` 0.31.1 tidak membuat akun
 IDL on-chain, jadi tidak ada rent IDL.
 
-Rincian lengkap + tabel: [`docs/PDA-INTERPOSING-GUIDE.md` §2.6](docs/PDA-INTERPOSING-GUIDE.md#26-mitos-pakai-pda-jadi-tidak-perlu-sewa-13-sol).
+### Biaya membuat token / pool, dan memeriksa wallet
+
+```bash
+npm run cost:launch        # token saja 0.006371 SOL; token + pool 0.022976 SOL (contoh 493 B)
+npm run cost:launch -- --legacy --no-pool
+npm run cost:wallet -- --address <WALLET> --rpc <RPC> --limit 50   # fee + rent akun baru
+```
+
+`cost:launch` dihitung dari jalur kode SDK yang sebenarnya (`buildCloneTokenInstructions`
++ `buildCreatePoolTx`). `cost:wallet` membaca riwayat on-chain — butuh RPC yang bisa diakses
+dari mesin Anda (sandbox pengembangan repo tidak punya akses RPC).
+
+Rincian lengkap + tabel: [`docs/PDA-INTERPOSING-GUIDE.md` §2.6](docs/PDA-INTERPOSING-GUIDE.md#26-mitos-pakai-pda-jadi-tidak-perlu-sewa-13-sol)
+dan [§2.7](docs/PDA-INTERPOSING-GUIDE.md#27-biaya-membuat-token-dan-pool-lewat-sdk-ini).
 
 ## Instal dari Nol di Linux (belum ada Node.js)
 
@@ -399,6 +415,8 @@ npm run dev      # Dashboard interaktif di http://localhost:5173 (0.0.0.0)
 npm run claim:creator -- --pool <POOL_PDA>   # Cek fee creator yang bisa diklaim (dry-run)
 npm run toolchain:check  # Cek toolchain SBF (rustc/Cargo untuk `anchor build`)
 npm run cost:deploy      # Estimasi SOL: rent deploy (dari ukuran .so), per pool, per mint
+npm run cost:launch      # Biaya membuat token (+pool) lewat SDK ini
+npm run cost:wallet -- --address <WALLET> --rpc <RPC>  # Fee + rent akun baru wallet
 
 anchor build     # Build smart contract Rust (butuh Anchor CLI 0.31.1 + Agave >= 4.0)
 anchor deploy    # Deploy program mini_amm ke devnet
